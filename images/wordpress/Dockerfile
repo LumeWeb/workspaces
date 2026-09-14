@@ -18,10 +18,11 @@
 FROM base
 
 # -- build-time inputs -------------------------------------------------------
-# Current stable WordPress release, pinned to its exact archive sha256. Tracked
-# in ./versions.env; keep the two in sync. Verify with `make deps-verify`.
-ARG WORDPRESS_VERSION=7.1
-ARG WORDPRESS_SHA256=05a5f89138f632b7329f1202f2a0553c5f7fe4daf8e4b9ca7ebae9b9466b9e86
+# Current stable WordPress release, pinned to its exact archive sha256. The
+# values live only in ./versions.env and are injected here by docker-bake.hcl
+# (no literals, so they cannot drift). Verify with `make deps-verify`.
+ARG WORDPRESS_VERSION
+ARG WORDPRESS_SHA256
 ARG VERSION=0.1.0
 
 # -- WordPress core (immutable) ---------------------------------------------

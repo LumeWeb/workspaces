@@ -12,6 +12,15 @@ built on the `php-caddy` base. Uses official WordPress conventions.
 | Listen | `0.0.0.0:${PORT:-8080}` |
 | Runtime user | `www-data` (non-root) |
 
+## Version pins — single source of truth
+
+The WordPress version/sha256 live **only** in `images/wordpress/versions.env`
+(the PHP/Caddy pins live in `images/php-caddy/versions.env`). `docker-bake.hcl`
+injects them into the Docker ARGs and OCI labels; the `Dockerfile` declares those
+ARGs **without hardcoded literals**, so there is no second copy to drift. Bump by
+editing `versions.env`, then run `make deps-verify` (which asserts bake forwards
+the same values) and rebuild.
+
 ## Persistence contract
 
 Only these three paths are persistent (mounted):

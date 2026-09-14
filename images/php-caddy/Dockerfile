@@ -8,25 +8,34 @@
 ## on non-loopback requests, exposes a loopback-exempt PHP-backed /healthz, and
 ## listens on 0.0.0.0:${PORT:-8080}.
 ##
-## Pinned upstream inputs (current stable series, exact digests/checksums) are
-## tracked here and mirrored in ./versions.env. Vertically bump by editing both.
+## All pinned upstream inputs (current stable series, exact digests/checksums)
+## live in ./versions.env — the single source of truth. docker-bake.hcl injects
+## them here as build ARGs (see Makefile "Pinned upstream inputs"). This
+## Dockerfile therefore declares those ARGs WITHOUT literals, so a bump only
+## edits versions.env and nothing can drift between versions.env and the build.
 ## --------------------------------------------------------------------------
 
 # Current stable PHP series at implementation time, pinned by exact digest.
-# Source of truth: https://hub.docker.com/_/php   (8.5.10-fpm-bookworm)
-ARG PHP_BASE=php:8.5.10-fpm-bookworm@sha256:81b9c405b013ebda0c9b8cd7a1a61424cf3627ca96348d93752a9b0539ce9a25
+# Values injected by bake from versions.env (PHP_BASE = image name,
+# PHP_BASE_DIGEST = its sha256); no literal here so the source of truth stays in
+# one place. FROM combines them into the same digest-pinned reference the image
+# previously hardcoded, preserving reproducibility.
+# (BuildKit emits an "InvalidDefaultArgInFrom" warning here because the ARGs
+# intentionally have no literal default; it is harmless — bake always injects
+# the pins before the FROM is evaluated, so the reference is valid at build.)
+ARG PHP_BASE
+ARG PHP_BASE_DIGEST
 
-FROM ${PHP_BASE}
+FROM ${PHP_BASE}@${PHP_BASE_DIGEST}
 
 # -- build-time inputs -------------------------------------------------------
-ARG CADDY_VERSION=2.11.4
+# Caddy release + per-arch sha512 (from upstream checksums.txt; the archive is
+# verified before install so a tampered/incorrect download fails the build).
+# Values injected by bake from versions.env (CADDY_VERSION / CADDY_SHA512_*).
+ARG CADDY_VERSION
 ARG TARGETARCH
-
-# Caddy release checksums (sha512) from the upstream checksums.txt, per
-# architecture. We verify the archive before install so a tampered/incorrect
-# download fails the build rather than shipping a broken/mutable binary.
-ARG CADDY_SHA512_AMD64=1c6f5404f3622e46d401d81f4af59677d46b886229c6694d60fd936b87c72d3bb5d1fcf42b55c8d555769fa75acf434ab618fc7e0df2c79cf8512ee580d38d06
-ARG CADDY_SHA512_ARM64=c43c62b7b583b31c682b3c3e1a31cf03759fbab01dcb0fc7d7fc3a5ce1bef43403583e26133920634a730a9fe31dae1386af4d3f9f3fc19fcc2c29ebf19de235
+ARG CADDY_SHA512_AMD64
+ARG CADDY_SHA512_ARM64
 
 # Image identity used by verification and releases.
 ARG VERSION=0.1.0

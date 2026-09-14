@@ -18,16 +18,63 @@ All upstream bases are **pinned**: exact PHP digest, exact Caddy release with
 per-arch sha512, and the exact WordPress archive sha256. No floating
 production `latest` tag.
 
+## Pinning / single source of truth
+
+Every upstream version, digest, and checksum lives in exactly **one** place —
+the `versions.env` files:
+
+- `images/php-caddy/versions.env` → PHP base + Caddy version and per-arch sha512
+- `images/wordpress/versions.env` → WordPress version and archive sha256
+
+The `Makefile` `include`s those files, `export`s the variables, and
+`docker-bake.hcl` reads them back from the process environment. Bake injects the
+values into the **Docker build ARGs** and mirrors them into **runtime OCI
+labels**. The Dockerfiles declare those ARGs **with no hardcoded default
+literal**, so a value exists in exactly one place and can never drift from what
+is actually built:
+
+```text
+versions.env ──► Makefile (include + export) ──► docker-bake.hcl variables
+                                                        │
+                                                        ├─► Docker build ARGs (PHP_BASE, CADDY_VERSION, …)
+                                                        └─► OCI runtime labels (base.digest, caddy.version, …)
+```
+
+To bump an upstream: edit the relevant `versions.env`, then run
+`make deps-verify` (re-checks upstream plus asserts bake forwards the same
+values) and the build/verify matrix. If bake wiring ever stops forwarding a pin,
+`make deps-verify` fails loudly rather than building an image that does not match
+`versions.env`.
+
+### Docker ARG vs ENV (why versions are ARGs)
+
+- **`ARG`** is a **build-time** variable: it exists only while the build runs
+  (available to `FROM`, `RUN`, and `LABEL` substitution inside the Dockerfile)
+  and is **not** retained in the final image or exposed at runtime.
+- **`ENV`** is a **runtime** variable: baked into the image and present in every
+  running container's environment.
+
+Upstream versions/digests/checksums are pure build inputs — they are consumed to
+fetch and verify artifacts during `docker build` and are of no use to the
+running container — so they are correctly modeled as **ARGs**. Using `ENV` for
+them would needlessly bloat the runtime environment (and leak pin metadata into
+`docker inspect`/`env`). Runtime configuration that the container actually needs
+today — `PORT`, `WORKSPACE_AUTH_*`, `PINNER_INIT`, DB settings — is delivered as
+`ENV` at runtime. The one build value that is also useful as **metadata** (the
+PHP/Caddy/WordPress pins) is exposed after the build via OCI **labels**, which
+come from the same single source without duplicating literals or polluting the
+runtime environment.
+
 ## Repository layout
 
 ```
 .
 ├── Makefile                     # build / lint / verify targets
-├── docker-bake.hcl              # single source of truth for image assembly
+├── docker-bake.hcl              # image assembly; injects pins from versions.env
 ├── compose/                     # local verification stacks (Compose)
 ├── images/
-│   ├── php-caddy/               # PHP-FPM + Caddy base image
-│   └── wordpress/               # WordPress workspace image
+│   ├── php-caddy/               # PHP-FPM + Caddy base image (+ versions.env pins)
+│   └── wordpress/               # WordPress workspace image (+ versions.env pins)
 └── scripts/                     # verification + pin checks
 ```
 
@@ -38,13 +85,24 @@ make build          # build all images for the current platform
 make lint           # shellcheck (+ hadolint if installed)
 ```
 
-Images are produced by `docker buildx bake`:
+Images are produced by `docker buildx bake`. Bake reads the upstream pins from
+the process environment, so they must be loaded from `versions.env` first —
+`make` does this for you, so prefer the `make` targets:
 
 ```sh
+# Preferred: pins are exported + fed to bake automatically.
+make build-php-caddy
+
+# Equivalent manual path (source the pins, then bake).
+set -a; . images/php-caddy/versions.env; . images/wordpress/versions.env; set +a
 docker buildx bake --set php-caddy.tags=pinner-php-caddy:local \
                    --set wordpress.tags=pinner-wordpress:local \
                    php-caddy wordpress
 ```
+
+Because the Dockerfiles carry **no** hardcoded pin literals, invoking `bake`
+without the pins sourced fails the build loudly (empty `FROM`/checksum) rather
+than silently drifting.
 
 Because `wordpress` layers on `php-caddy`, bake builds the base first and feeds
 it as a named context (`contexts.base = target:php-caddy`).
@@ -96,7 +154,7 @@ overwritten. See `images/wordpress/README.md` for the security trade-off.
 make verify           # build everything, then run the full matrix
 make verify-wordpress # build + verify WordPress with MariaDB
 make verify-php-caddy # verify the base image
-make deps-verify      # re-check pinned upstream checksums
+make deps-verify      # re-check upstream pins AND that bake forwards them (no drift)
 ```
 
 `make verify-wordpress` boots WordPress + MariaDB via Compose and proves:

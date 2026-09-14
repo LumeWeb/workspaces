@@ -14,6 +14,15 @@ workspace HTTP Basic Auth on public (non-loopback) requests.
 | PHP-FPM | `127.0.0.1:9000` |
 | Runtime user | `www-data` |
 
+## Version pins — single source of truth
+
+The PHP base and Caddy version/digests live **only** in `images/php-caddy/versions.env`.
+The build (`docker-bake.hcl`) injects them as Docker ARGs and mirrors them into
+the OCI labels; the `Dockerfile` declares those ARGs **without hardcoded
+literals**, so there is no second copy to drift. Bump by editing
+`versions.env`, then run `make deps-verify` (which also asserts bake forwards
+the same values) and rebuild. Verify with `make deps-verify`.
+
 ## HTTP Basic Auth (portal-plugin-ipfs PR #1031)
 
 The Pinner portal injects two **secret** environment variables, and this image

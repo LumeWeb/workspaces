@@ -6,6 +6,20 @@ VERSION       ?= 0.1.0
 BAKE          ?= docker buildx bake
 HADOLINT      ?= hadolint
 
+# -- Pinned upstream inputs ---------------------------------------------------
+# Single authoritative source for every upstream pin. Make loads them into the
+# variables below, exports them, and bake reads them back from the process
+# environment — so the exact values flow into the Docker build ARGs and the
+# runtime OCI labels. The Dockerfiles declare these ARGs with NO hardcoded
+# defaults, so a value exists in exactly one place and cannot drift. Bump by
+# editing versions.env, then `make verify-pins` + the build/verify matrix.
+include images/php-caddy/versions.env
+include images/wordpress/versions.env
+export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
+       CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
+       WORDPRESS_VERSION WORDPRESS_SHA256
+
+
 # Image references produced by `make build` (on the current platform). These
 # are the same references the local Compose verification consumes.
 PHP_CADDY_IMAGE ?= $(REGISTRY)/pinner-php-caddy:$(VERSION)
@@ -13,7 +27,7 @@ WORDPRESS_IMAGE ?= $(REGISTRY)/pinner-wordpress:$(VERSION)
 
 .PHONY: help build build-php-caddy build-wordpress \
         lint shellcheck hadolint \
-        verify verify-php-caddy verify-wordpress deps-verify clean
+        verify verify-php-caddy verify-wordpress deps-verify verify-pins clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
@@ -58,8 +72,10 @@ verify-wordpress: build-wordpress ## Verify the WordPress image locally (Compose
 
 ## -- misc -----------------------------------------------------------------
 
-deps-verify: ## Verify pinned upstream checksums are still correct
+deps-verify: ## Verify pinned upstream checksums (+ bake args match versions.env)
 	bash scripts/verify-pins.sh
+
+verify-pins: deps-verify ## Alias for deps-verify (verify upstream pins + no drift)
 
 clean: ## Tear down any leftover verification containers/volumes
 	docker compose -f compose/wordpress.local.yaml down -v --remove-orphans 2>/dev/null || true

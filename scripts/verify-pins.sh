@@ -16,6 +16,14 @@ WP_ENV="$SCRIPT_DIR/../images/wordpress/versions.env"
 # shellcheck disable=SC1090
 . "$WP_ENV"
 
+# docker-bake.hcl injects the pins as build ARGs by reading them from the
+# process environment (Make sources versions.env and exports them). Export them
+# here too so the bake-args drift check below sees the same values the build
+# path would.
+export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
+       CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
+       WORDPRESS_VERSION WORDPRESS_SHA256
+
 echo "== [deps] checking Caddy checksums ($CADDY_VERSION) =="
 curl -fsSL -o /tmp/caddy-checksums.txt \
     "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_checksums.txt"
@@ -48,5 +56,59 @@ echo "  ok  PHP ${PHP_VERSION} digest matches upstream"
 echo "== [deps] WordPress ${WORDPRESS_VERSION} =="
 echo "  WordPress archive sha256 is verified at Docker build time (skip here)."
 echo "  pinned: $WORDPRESS_SHA256"
+
+# Drift guard: versions.env is the single source of truth, but the Docker build
+# only sees what docker-bake.hcl injects. Verify the resolved bake plan passes
+# exactly the versions.env values as build ARGs (and the OCI labels that mirror
+# them). If bake wiring ever stops forwarding a pin, this fails loudly here
+# instead of silently building an image that does not match versions.env.
+echo "== [deps] checking bake ARGs/labels match versions.env (no drift) =="
+if command -v docker >/dev/null 2>&1; then
+    bake_plan="$(docker buildx bake --print 2>/dev/null || true)"
+    if [ -z "$bake_plan" ]; then
+        echo "WARN: could not run 'docker buildx bake --print' — skipping bake drift check." >&2
+    else
+        get_json_arg() { # <target> <key>
+            printf '%s' "$bake_plan" | python3 -c \
+                "import sys,json; d=json.load(sys.stdin); print(d['target']['$1']['args'].get('$2',''))"
+        }
+        get_json_label() { # <target> <key>
+            printf '%s' "$bake_plan" | python3 -c \
+                "import sys,json; d=json.load(sys.stdin); print(d['target']['$1']['labels'].get('$2',''))"
+        }
+        check_bake() { # <target> <what> <key> <want>
+            got="$(get_json_arg "$1" "$3")"
+            [ "$got" = "$4" ] || {
+                echo "FAIL: bake $1.$3 ($2) = '$got', versions.env = '$4'" >&2
+                exit 1
+            }
+            echo "  ok  bake $1.$3 == versions.env ($got)"
+        }
+        check_bake php-caddy "PHP base image"   PHP_BASE           "$PHP_BASE"
+        check_bake php-caddy "PHP base digest"  PHP_BASE_DIGEST    "$PHP_BASE_DIGEST"
+        check_bake php-caddy "Caddy version"    CADDY_VERSION      "$CADDY_VERSION"
+        check_bake php-caddy "Caddy amd64 sha"  CADDY_SHA512_AMD64 "$CADDY_SHA512_AMD64"
+        check_bake php-caddy "Caddy arm64 sha"  CADDY_SHA512_ARM64 "$CADDY_SHA512_ARM64"
+        check_bake wordpress "WP version"       WORDPRESS_VERSION  "$WORDPRESS_VERSION"
+        check_bake wordpress "WP sha256"        WORDPRESS_SHA256   "$WORDPRESS_SHA256"
+
+        # Runtime labels must mirror the same single source (they are fed from
+        # the same bake variables, so this is cross-checking the mechanism).
+        base_digest_label="$(get_json_label php-caddy org.opencontainers.image.base.digest)"
+        [ "$base_digest_label" = "$PHP_BASE_DIGEST" ] || {
+            echo "FAIL: php-caddy label org.opencontainers.image.base.digest = '$base_digest_label', versions.env = '$PHP_BASE_DIGEST'" >&2
+            exit 1
+        }
+        echo "  ok  php-caddy label org.opencontainers.image.base.digest == versions.env ($base_digest_label)"
+        caddy_label="$(get_json_label php-caddy com.lumeweb.caddy.version)"
+        [ "$caddy_label" = "$CADDY_VERSION" ] || {
+            echo "FAIL: php-caddy label com.lumeweb.caddy.version = '$caddy_label', versions.env = '$CADDY_VERSION'" >&2
+            exit 1
+        }
+        echo "  ok  php-caddy label com.lumeweb.caddy.version == versions.env ($caddy_label)"
+    fi
+else
+    echo "WARN: docker not installed — skipping bake drift check." >&2
+fi
 
 echo "== [deps] ALL PINS VERIFIED =="

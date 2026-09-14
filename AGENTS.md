@@ -52,7 +52,12 @@ make lint      # shellcheck (hadolint if available)
 make build     # build all images for current platform
 make verify    # run the full local verification matrix
 make verify-wordpress  # build + verify the WordPress image locally
+make deps-verify      # re-check upstream pins AND that bake forwards them (no drift)
 ```
+
+Upstream pins (PHP/Caddy/WordPress versions + digests/checksums) are single-
+sourced in `images/*/versions.env` and injected by `docker-bake.hcl`. The
+Dockerfiles must NOT hardcode pin literals; bump by editing `versions.env`.
 
 Agent note: use the `file_write`/`file_edit` tools for edits. Never use shell
 redirection, `sed`, or `awk` to modify repository files. Shell is for
