@@ -14,8 +14,18 @@ on:
         required: true
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_OWNER: lumeweb
+  # Registry HOST, used only to authenticate with the GHCR login step.
+  # Deliberately named REGISTRY_HOST and NOT `REGISTRY`: bake reads a REGISTRY
+  # environment variable and it OVERRIDES docker-bake.hcl's default of the full
+  # "ghcr.io/lumeweb" path. If a bare `REGISTRY=ghcr.io` leaked into the build
+  # step's environment, bake would push to ghcr.io/... WITHOUT the lumeweb
+  # namespace (verified: REGISTRY=ghcr.io -> ghcr.io/workspace-wordpress vs
+  # default -> ghcr.io/lumeweb/workspace-wordpress). Leaving the bake variable
+  # unset lets the HCL default, the build, and the digest-report step all agree
+  # on the exact same image path. IMAGE_OWNER is likewise dropped: the digest
+  # step resolves its image from bake's own --print output instead of
+  # re-deriving the path by hand (see the "Resolve bake image paths" step).
+  REGISTRY_HOST: ghcr.io
 
 jobs:
   release:
@@ -31,7 +41,7 @@ jobs:
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.REGISTRY_HOST }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Derive recipe version
@@ -66,6 +76,37 @@ jobs:
           VERSION="${{ steps.version.outputs.recipe }}" docker buildx bake --push \
             --set '*.platform=linux/amd64,linux/arm64' \
             php-caddy wordpress
+      # Static validation + single source of truth for the digest step below.
+      # Resolve the exact primary tag that `docker buildx bake` will produce for
+      # the wordpress target (docker-bake.hcl owns the REGISTRY/VERSION path and
+      # bake reads those variables from the environment, overriding HCL defaults)
+      # and reuse THAT tag for image inspect. Digest reporting therefore can
+      # never drift from the published image path, and the explicit namespace
+      # assertion below catches any future REGISTRY env leak (which would drop
+      # the "lumeweb" owner from the path and silently cause a 404 / wrong-image
+      # inspection).
+      - name: Resolve bake image paths
+        id: bake
+        run: |
+          bake_json="$(VERSION="${{ steps.version.outputs.recipe }}" docker buildx bake --print)"
+          wordpress_tag="$(printf '%s' "$bake_json" | jq -r '.target.wordpress.tags[0]')"
+          if [ -z "$wordpress_tag" ] || [ "$wordpress_tag" = "null" ]; then
+            echo "::error::unable to resolve workspace-wordpress tag from bake output" >&2
+            exit 1
+          fi
+          # Guard against a REGISTRY env leak dropping the owner namespace.
+          case "$wordpress_tag" in
+            ghcr.io/lumeweb/*) : ;;
+            *)
+              echo "::error::bake wordpress tag '$wordpress_tag' missing expected ghcr.io/lumeweb/ owner namespace" >&2
+              exit 1
+              ;;
+          esac
+          echo "wordpress_tag=${wordpress_tag}" >> "$GITHUB_OUTPUT"
+          echo "resolved workspace-wordpress image: ${wordpress_tag}"
       - name: Report digests
         run: |
-          docker buildx imagetools inspect "$REGISTRY/$IMAGE_OWNER/workspace-wordpress:${{ steps.version.outputs.recipe }}"
+          # Inspect the exact tag bake pushed (resolved from bake's --print
+          # output above), so the reported digest always matches the published
+          # image path.
+          docker buildx imagetools inspect "${{ steps.bake.outputs.wordpress_tag }}"
