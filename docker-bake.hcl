@@ -81,7 +81,7 @@ target "wordpress" {
     "org.opencontainers.image.base.name"   = PHP_BASE
     "com.lumeweb.wordpress.version"        = WORDPRESS_VERSION
   }
-  tags       = ["${REGISTRY}/pinner-wordpress:${VERSION}"]
+  tags       = ["${REGISTRY}/workspace-wordpress:${VERSION}"]
 }
 
 group "default" {

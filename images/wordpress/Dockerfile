@@ -48,6 +48,6 @@ COPY wp-config-generator.php /usr/local/bin/wp-config-generator
 RUN chmod +x /usr/local/bin/pinner-wp-init /usr/local/bin/wp-config-generator
 ENV PINNER_INIT=/usr/local/bin/pinner-wp-init
 
-LABEL org.opencontainers.image.title="pinner-wordpress" \
+LABEL org.opencontainers.image.title="workspace-wordpress" \
       org.opencontainers.image.description="Pinner WordPress on Caddy + PHP-FPM" \
       org.opencontainers.image.version="${VERSION}"

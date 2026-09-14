@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: |
+          Release version to build and push (e.g. 0.2.0). Required for manual
+          runs; on a tag push the version is derived from the tag (v-prefix
+          stripped) and this input is ignored.
+        type: string
+        required: true
 
 env:
   REGISTRY: ghcr.io
@@ -27,7 +36,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Derive recipe version
         id: version
-        run: echo "recipe=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual run: use the explicit version input. On dispatch GITHUB_REF_NAME
+            # is the branch name, NOT a tag, so we must not fall back to it.
+            recipe="${{ inputs.version }}"
+            if [[ -z "$recipe" ]]; then
+              echo "::error::No version provided for manual release. Use the 'version' input (e.g. 0.2.0)." >&2
+              exit 1
+            fi
+          else
+            # Tag push (v*): derive from the tag, stripping the v-prefix.
+            recipe="${GITHUB_REF_NAME#v}"
+          fi
+          echo "recipe=${recipe}" >> "$GITHUB_OUTPUT"
       - name: Build and push
         run: |
           # Pinned upstream inputs (PHP/Caddy/WordPress versions + digests) are
@@ -46,4 +68,4 @@ jobs:
             php-caddy wordpress
       - name: Report digests
         run: |
-          docker buildx imagetools inspect "$REGISTRY/$IMAGE_OWNER/pinner-wordpress:${{ steps.version.outputs.recipe }}"
+          docker buildx imagetools inspect "$REGISTRY/$IMAGE_OWNER/workspace-wordpress:${{ steps.version.outputs.recipe }}"

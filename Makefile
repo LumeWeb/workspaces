@@ -14,14 +14,14 @@ HADOLINT      ?= hadolint
 REGISTRY ?= ghcr.io/lumeweb
 VERSION  ?= 0.1.0
 RELEASE_PHP_CADDY_IMAGE ?= $(REGISTRY)/pinner-php-caddy:$(VERSION)
-RELEASE_WORDPRESS_IMAGE ?= $(REGISTRY)/pinner-wordpress:$(VERSION)
+RELEASE_WORDPRESS_IMAGE ?= $(REGISTRY)/workspace-wordpress:$(VERSION)
 
 # Local-only verification references. `make build` builds these tags and loads
 # them into the local docker daemon (`--load`), so Compose and the verification
 # scripts start them without ever pulling a (possibly private, authenticated)
 # GHCR image. They are intentionally NOT registry-qualified.
 PHP_CADDY_IMAGE ?= pinner-php-caddy:local
-WORDPRESS_IMAGE ?= pinner-wordpress:local
+WORDPRESS_IMAGE ?= workspace-wordpress:local
 
 # -- Pinned upstream inputs ---------------------------------------------------
 # Single authoritative source for every upstream pin. Make loads them into the

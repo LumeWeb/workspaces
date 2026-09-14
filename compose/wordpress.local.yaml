@@ -10,7 +10,7 @@
 # `make build-wordpress` first) so the image is produced by docker-bake, then
 # this file simply consumes WORDPRESS_IMAGE. This keeps bake the single
 # source of truth for how images are assembled.
-name: pinner-wordpress-local
+name: workspace-wordpress-local
 
 services:
   db:
@@ -38,7 +38,7 @@ services:
     # scripts always set WORDPRESS_IMAGE from the built local tag; this fallback
     # just keeps a bare `docker compose up` fail-closed against the locally
     # built image instead of drifting to a published GHCR pull.
-    image: ${WORDPRESS_IMAGE:-pinner-wordpress:local}
+    image: ${WORDPRESS_IMAGE:-workspace-wordpress:local}
     environment:
       PORT: "8080"
       WORDPRESS_DB_HOST: db

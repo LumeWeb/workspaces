@@ -12,7 +12,7 @@ The first image is **WordPress served by Caddy on PHP-FPM**, built on a reusable
 | Image | Description | Runtime |
 |---|---|---|
 | `pinner-php-caddy` | Reusable PHP-FPM + Caddy base | `php:8.5.10` + Caddy `2.11.4` |
-| `pinner-wordpress` | WordPress workspace | WordPress `7.1` on the base |
+| `workspace-wordpress` | WordPress workspace | WordPress `7.1` on the base |
 
 All upstream bases are **pinned**: exact PHP digest, exact Caddy release with
 per-arch sha512, and the exact WordPress archive sha256. No floating
@@ -102,7 +102,7 @@ make build-php-caddy
 set -a; . images/php-caddy/versions.env; . images/wordpress/versions.env; set +a
 docker buildx bake --load \
                    --set php-caddy.tags=pinner-php-caddy:local \
-                   --set wordpress.tags=pinner-wordpress:local \
+                   --set wordpress.tags=workspace-wordpress:local \
                    php-caddy wordpress
 ```
 
@@ -199,7 +199,7 @@ the git tag: a pushed tag `vX.Y.Z` publishes `:<X.Y.Z>` (never a floating
 `latest`).
 
 ```text
-ghcr.io/lumeweb/pinner-wordpress:0.1.0    # from git tag v0.1.0
+ghcr.io/lumeweb/workspace-wordpress:0.1.0    # from git tag v0.1.0
 ghcr.io/lumeweb/pinner-php-caddy:0.1.0    # from git tag v0.1.0
 ```
 
