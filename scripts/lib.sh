@@ -13,6 +13,32 @@ pass() {
     echo "PASS: $*"
 }
 
+# Refuse to verify an image reference that points at a published / remote
+# registry. Local verification must ONLY exercise images that were just built
+# and loaded into the local docker daemon (by `make build`, e.g.
+# pinner-php-caddy:local). Pointing it at a registry reference (ghcr.io, any
+# remote host, or a host:port) would require authentication or a clean pull —
+# and silently reusing a stale locally-tagged GHCR image would mask what is
+# actually being tested. Fail loudly instead.
+require_local_image() {
+    image="$1"
+    case "$image" in
+        */*)
+            # A slash means an explicit first path component; if that component
+            # carries a registry host (a dot, a port, or an explicit localhost /
+            # IP / bracketed IPv6 literal) the reference is registry-qualified.
+            host="${image%%/*}"
+            case "$host" in
+                *.*|*:*|localhost|'['*)
+                    die "refusing to verify remote/published image '$image': local verification requires a locally built + loaded image (e.g. pinner-php-caddy:local). Build + load it first with 'make build'; never pass a GHCR/registry reference."
+                    ;;
+            esac
+            ;;
+    esac
+    docker image inspect "$image" >/dev/null 2>&1 \
+        || die "image '$image' is not present in the local docker daemon. Build + load it first with 'make build' (a bare/remote name would require a registry pull)."
+}
+
 # Poll an HTTP URL until it returns HTTP 200 (or a whole-prefix match),
 # supplying HTTP Basic Auth credentials with each request (the workspace image
 # enforces Basic Auth on non-loopback requests).

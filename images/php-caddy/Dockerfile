@@ -17,14 +17,22 @@
 
 # Current stable PHP series at implementation time, pinned by exact digest.
 # Values injected by bake from versions.env (PHP_BASE = image name,
-# PHP_BASE_DIGEST = its sha256); no literal here so the source of truth stays in
-# one place. FROM combines them into the same digest-pinned reference the image
-# previously hardcoded, preserving reproducibility.
-# (BuildKit emits an "InvalidDefaultArgInFrom" warning here because the ARGs
-# intentionally have no literal default; it is harmless — bake always injects
-# the pins before the FROM is evaluated, so the reference is valid at build.)
-ARG PHP_BASE
-ARG PHP_BASE_DIGEST
+# PHP_BASE_DIGEST = its sha256); the real pins live ONLY in versions.env so the
+# source of truth stays in one place and cannot drift. FROM combines them into
+# the same digest-pinned reference the image previously hardcoded, preserving
+# reproducibility.
+#
+# These ARGs carry a NON-PRODUCTION placeholder default rather than an empty
+# one, for two reasons: (1) it satisfies BuildKit's static FROM validation and
+# removes the "InvalidDefaultArgInFrom" warning, and (2) it stays fail-closed —
+# the placeholder is a well-formed but deliberately *unresolvable* image
+# reference, so if bake ever fails to inject the real pins the FROM cannot
+# resolve at pull time and the build fails loudly instead of silently building
+# against the wrong (or no) base. It never duplicates the real pinned values,
+# so it cannot drift. The placeholder is only ever used when the pins were NOT
+# injected (i.e. a bypassed/mis-wired build path).
+ARG PHP_BASE=pinner-php-caddy-base-unset
+ARG PHP_BASE_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
 
 FROM ${PHP_BASE}@${PHP_BASE_DIGEST}
 

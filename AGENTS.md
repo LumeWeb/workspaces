@@ -51,6 +51,7 @@ make help      # list targets
 make lint      # shellcheck (hadolint if available)
 make build     # build all images for current platform
 make verify    # run the full local verification matrix
+make verify-wp-config-generator  # focused unit checks for the PHP wp-config generator
 make verify-wordpress  # build + verify the WordPress image locally
 make deps-verify      # re-check upstream pins AND that bake forwards them (no drift)
 ```

@@ -61,14 +61,39 @@ Runs as root (via the base `PINNER_INIT` hook) before privileges are dropped:
 
 1. **Seed core** — copy immutable `/usr/src/wordpress` → ephemeral docroot
    (skipping `wp-content`).
-2. **Generate `wp-config.php`** from `WORDPRESS_DB_*` + `PORTAL_WORKSPACE_URL`,
-   honouring `X-Forwarded-*` for HTTPS-correct links behind the Coolify proxy.
+2. **Generate `wp-config.php`** — delegated to a dedicated PHP generator
+   (`/usr/local/bin/wp-config-generator`, installed by the Dockerfile and run
+   here as root) that reads `WORDPRESS_DB_*` + `PORTAL_WORKSPACE_URL` directly
+   from the environment and writes the file atomically via a private **0600**
+   temp file it renames into place. After generation the init chowns it to
+   `www-data` (owner-only read; never world-readable).
 3. **Seed `themes` and `plugins`** from `/usr/src/wordpress/wp-content` onto the
    mounted volumes (copy-based, never symlinks), so the default theme and
    bundled plugins appear on a brand-new shadowing volume.
 4. **Leave `uploads` unseeded** (user media only).
 5. **Ownership** — repair root-owned mount roots; only recursive-chown when the
    mount root is not already owned by `www-data`.
+
+### `wp-config.php` generation
+
+- **Safe serialization** — every value (DB name/user/password, `host:port`,
+  table prefix, `WP_HOME`/`WP_SITEURL`) is emitted with PHP `var_export()`, so
+  quotes, backslashes, dollar signs, newlines and non-ASCII bytes round-trip
+  exactly and can never break out of (or into) a generated literal. No shell
+  interpolation is used and **no secret ever appears on `argv` or in logs**.
+- **No WP-CLI, no DB connection** — generation never touches the database, so
+  it works while the DB is still down at boot.
+- **Host/port** — a `:port` already on `WORDPRESS_DB_HOST` is honoured;
+  `WORDPRESS_DB_PORT` is appended only when the host has no port.
+- **Proxy/URL** — `PORTAL_WORKSPACE_URL` sets `WP_HOME`/`WP_SITEURL`; the
+  standard `X-Forwarded-Proto`/`X-Forwarded-Host` HTTPS block is preserved.
+- **Missing DB env is non-fatal** — if `WORDPRESS_DB_HOST` is unset the
+  generator prints a warning and exits 0 without creating the file, so an image
+  booted without DB config still starts (diagnostics). Once configured it
+  regenerates on every start and the config stays ephemeral.
+- **Salts** are generated fresh per boot. `WP_CACHE_KEY_SALT` is intentionally
+  *not* set (no persistent object cache; the whole config is ephemeral), which
+  preserves prior behaviour.
 
 ### Seeding policy
 

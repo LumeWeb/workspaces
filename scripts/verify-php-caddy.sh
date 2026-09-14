@@ -31,6 +31,11 @@ done
 
 [ -n "$IMAGE" ] || { echo "missing --image" >&2; exit 2; }
 
+# Local verification must never exercise a published/remote GHCR image: build
+# + load locally first (make build) and pass the local tag. Reject anything that
+# looks like a registry reference or is absent from the local daemon.
+require_local_image "$IMAGE"
+
 # Host port the compose maps to the container listener; must match the
 # php-caddy.local.yaml port mapping below so a custom HOST_PORT works.
 HOST_PORT="${HOST_PORT:-8081}"

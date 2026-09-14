@@ -29,9 +29,13 @@ the `versions.env` files:
 The `Makefile` `include`s those files, `export`s the variables, and
 `docker-bake.hcl` reads them back from the process environment. Bake injects the
 values into the **Docker build ARGs** and mirrors them into **runtime OCI
-labels**. The Dockerfiles declare those ARGs **with no hardcoded default
-literal**, so a value exists in exactly one place and can never drift from what
-is actually built:
+labels**. The Dockerfiles declare those ARGs **with no hardcoded *production*
+default literal**, so a real pin value exists in exactly one place and can never
+drift from what is actually built. The two FROM ARGs in the php-caddy
+Dockerfile carry a well-formed but deliberately **unresolvable non-production
+placeholder** default: it satisfies BuildKit's static FROM validation (no
+"InvalidDefaultArgInFrom" warning) while still failing the build fast if bake
+ever fails to inject the real pins — without duplicating a real version/digest:
 
 ```text
 versions.env ──► Makefile (include + export) ──► docker-bake.hcl variables
@@ -90,19 +94,31 @@ the process environment, so they must be loaded from `versions.env` first —
 `make` does this for you, so prefer the `make` targets:
 
 ```sh
-# Preferred: pins are exported + fed to bake automatically.
+# Preferred: pins are exported + fed to bake automatically, and the built images
+# are tagged + loaded into the local docker daemon for verification.
 make build-php-caddy
 
-# Equivalent manual path (source the pins, then bake).
+# Equivalent manual path (source the pins, then load the local tags).
 set -a; . images/php-caddy/versions.env; . images/wordpress/versions.env; set +a
-docker buildx bake --set php-caddy.tags=pinner-php-caddy:local \
+docker buildx bake --load \
+                   --set php-caddy.tags=pinner-php-caddy:local \
                    --set wordpress.tags=pinner-wordpress:local \
                    php-caddy wordpress
 ```
 
-Because the Dockerfiles carry **no** hardcoded pin literals, invoking `bake`
-without the pins sourced fails the build loudly (empty `FROM`/checksum) rather
-than silently drifting.
+**Local vs release references.** `make build`/`build-*` tag the images with
+**local-only** names (e.g. `pinner-php-caddy:local`) and `--load` them into the
+local docker daemon. That is required under the **`docker-container` buildx
+driver**, which otherwise leaves the build result in the cache (a "No output
+specified" / "image remains cache" warning) and never puts it where Compose can
+reach it. The GHCR release references (`ghcr.io/lumeweb/pinner-php-caddy:<version>`,
+derived from `REGISTRY`/`VERSION`) are used **only** by the CD release workflow
+(`.github/workflows/release.yml` `--push`); local build/verify never touch them,
+so a local run needs no registry access or authentication.
+
+Because the Dockerfiles carry **no** hardcoded *production* pin literals,
+invoking `bake` without the pins sourced fails the build loudly (unresolvable
+placeholder `FROM`/empty checksum) rather than silently drifting.
 
 Because `wordpress` layers on `php-caddy`, bake builds the base first and feeds
 it as a named context (`contexts.base = target:php-caddy`).
@@ -156,6 +172,13 @@ make verify-wordpress # build + verify WordPress with MariaDB
 make verify-php-caddy # verify the base image
 make deps-verify      # re-check upstream pins AND that bake forwards them (no drift)
 ```
+
+Every `verify-*` target builds + loads the local images first, then exercises
+those **local-only tags** through Compose. The scripts refuse to verify a
+published/remote (registry-qualified) reference and require the built image to
+be present in the local daemon; if you pass `--image ghcr.io/...` or a name that
+isn't loaded locally, they fail with a clear error instead of pulling — a local
+`make verify` therefore never needs GHCR authentication.
 
 `make verify-wordpress` boots WordPress + MariaDB via Compose and proves:
 

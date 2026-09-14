@@ -43,8 +43,9 @@ RUN set -eux; \
 # generates wp-config.php, fixes ownership, and only then lets the base drop to
 # www-data and start Caddy + PHP-FPM.
 COPY wp-init.sh /usr/local/bin/pinner-wp-init
+COPY wp-config-generator.php /usr/local/bin/wp-config-generator
 
-RUN chmod +x /usr/local/bin/pinner-wp-init
+RUN chmod +x /usr/local/bin/pinner-wp-init /usr/local/bin/wp-config-generator
 ENV PINNER_INIT=/usr/local/bin/pinner-wp-init
 
 LABEL org.opencontainers.image.title="pinner-wordpress" \

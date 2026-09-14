@@ -32,7 +32,13 @@ services:
     restart: "no"
 
   wordpress:
-    image: ${WORDPRESS_IMAGE:-ghcr.io/lumeweb/pinner-wordpress:0.1.0}
+    # Local-only verification image: `make build-wordpress` produces and loads
+    # this tag. It is NOT a registry reference, so `docker compose up` here
+    # never pulls a (private, authenticated) GHCR image. The verification
+    # scripts always set WORDPRESS_IMAGE from the built local tag; this fallback
+    # just keeps a bare `docker compose up` fail-closed against the locally
+    # built image instead of drifting to a published GHCR pull.
+    image: ${WORDPRESS_IMAGE:-pinner-wordpress:local}
     environment:
       PORT: "8080"
       WORDPRESS_DB_HOST: db

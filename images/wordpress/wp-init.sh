@@ -23,6 +23,12 @@ DOCROOT=/var/www/html
 SRC=/usr/src/wordpress
 WP_CONTENT="$DOCROOT/wp-content"
 
+# Dedicated PHP generator for wp-config.php (installed by the Dockerfile and
+# run here as root). It reads WORDPRESS_DB_*/PORTAL_WORKSPACE_URL straight from
+# the environment, uses var_export for every value (no shell interpolation, no
+# secrets in argv/logs) and writes atomically via a private 0600 temp file.
+WP_CONFIG_GENERATOR=/usr/local/bin/wp-config-generator
+
 # True when a directory contains no real (non-dotfile) entries. We ignore
 # dotfiles so our own lock/marker files never make a fresh volume look
 # user-populated.
@@ -45,103 +51,25 @@ seed_core() {
     mkdir -p "$WP_CONTENT"
 }
 
-# Emit a PHP single-quoted string literal for an arbitrary value, escaping
-# backslashes and single quotes so nothing can break out of (or into) the
-# literal regardless of the value's content. Used for every interpolated value
-# in wp-config.php so DB secrets and other env cannot inject PHP or shell code.
-php_lit() {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g")"
-}
-
-# Generate an ephemeral wp-config.php from environment. Regenerated every start
-# (never persisted). Uses the portal-provided public URL for home/site URL and
-# honours X-Forwarded-* so HTTPS links stay correct behind the Coolify proxy.
+# Generate an ephemeral wp-config.php from the environment, regenerated every
+# start (never persisted). All generation is delegated to a dedicated PHP
+# script (WP_CONFIG_GENERATOR) that reads WORDPRESS_DB_* / PORTAL_WORKSPACE_URL
+# directly, emits every value with var_export (safe PHP serialization — no shell
+# interpolation, no secrets in argv/logs), and writes atomically via a private
+# 0600 temp file it then renames into place. No WP-CLI and no DB connection are
+# used, so this works while the DB is still down at boot.
 #
-# Dynamic values are emitted via printf with PHP-single-quote escaping (php_lit),
-# so secrets containing shell metacharacters, single quotes, or backslashes are
-# written literally and are never re-interpreted by the shell. Static content
-# uses a quoted heredoc (no expansion at all).
+# A missing WORDPRESS_DB_HOST is non-fatal: the generator warns and exits 0
+# without creating the file, so an image booted without DB config still starts.
 generate_wp_config() {
-    if [ -z "${WORDPRESS_DB_HOST:-}" ]; then
-        echo "WARN: WORDPRESS_DB_HOST unset; skipping wp-config.php generation." >&2
-        return 0
+    php "$WP_CONFIG_GENERATOR" "$DOCROOT"
+
+    # The generator wrote final mode 0600 owned by root; hand it to the app user
+    # so www-data can read it as owner at runtime and it is not world-readable.
+    # Only touches the file when generation actually produced one.
+    if [ -e "$DOCROOT/wp-config.php" ]; then
+        chown "$APP_USER:$APP_USER" "$DOCROOT/wp-config.php"
     fi
-
-    # MariaDB host, with an optional port suffix. If WORDPRESS_DB_HOST already
-    # carries a port ("host:port") honour it; otherwise append WORDPRESS_DB_PORT
-    # so a port is not doubled up (host:port + port -> host:port:port).
-    local dbhost="$WORDPRESS_DB_HOST"
-    case "$dbhost" in
-        *:*) : ;;
-        *)  if [ -n "${WORDPRESS_DB_PORT:-}" ]; then
-                dbhost="$dbhost:${WORDPRESS_DB_PORT}"
-            fi ;;
-    esac
-
-    local salts=""
-    local key
-    local secret
-    for key in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY \
-               AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
-        secret="$(head -c 48 /dev/urandom | base64 | tr -d '\n')"
-        salts="${salts}define('${key}', '${secret}');"$'\n'
-    done
-
-    local home="${PORTAL_WORKSPACE_URL:-}"
-
-    {
-        cat <<'EOF'
-<?php
-/**
- * Auto-generated at container start by the Pinner WordPress init hook.
- * Ephemeral; regenerated on every start. Do not edit.
- */
-EOF
-        printf "define( 'DB_NAME', %s );\n" "$(php_lit "${WORDPRESS_DB_NAME:-}")"
-        printf "define( 'DB_USER', %s );\n" "$(php_lit "${WORDPRESS_DB_USER:-}")"
-        printf "define( 'DB_PASSWORD', %s );\n" "$(php_lit "${WORDPRESS_DB_PASSWORD:-}")"
-        printf "define( 'DB_HOST', %s );\n" "$(php_lit "$dbhost")"
-        cat <<'EOF'
-define( 'DB_CHARSET', 'utf8mb4' );
-define( 'DB_COLLATE', '' );
-
-EOF
-        printf '%s' "$salts"
-        cat <<'EOF'
-define( 'WP_DEBUG', false );
-
-EOF
-        printf "\$table_prefix = %s;\n" "$(php_lit "${WORDPRESS_TABLE_PREFIX:-wp_}")"
-
-        cat <<'EOF'
-
-/**
- * TLS is terminated by the upstream Coolify proxy; trust the forwarded scheme
- * and host so generated links and redirects stay HTTPS-correct even though the
- * container itself speaks plain HTTP on PORT.
- */
-if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $_SERVER['HTTP_X_FORWARDED_PROTO'] ) {
-    $_SERVER['HTTPS'] = 'on';
-}
-if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
-    $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
-}
-
-EOF
-        if [ -n "$home" ]; then
-            printf "define( 'WP_HOME', %s );\n" "$(php_lit "$home")"
-            printf "define( 'WP_SITEURL', %s );\n" "$(php_lit "$home")"
-        fi
-
-        cat <<'EOF'
-
-if ( ! defined( 'ABSPATH' ) ) {
-    define( 'ABSPATH', __DIR__ . '/' );
-}
-require_once ABSPATH . 'wp-settings.php';
-EOF
-    } > "$DOCROOT/wp-config.php"
-    chown "$APP_USER:$APP_USER" "$DOCROOT/wp-config.php"
 }
 
 # One-time seed of a persistent mounted directory (themes or plugins) from the

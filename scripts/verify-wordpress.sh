@@ -31,6 +31,11 @@ WP_CLI_URL="https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION
 
 : "${WORDPRESS_IMAGE:?set WORDPRESS_IMAGE to the built WordPress image}"
 
+# Local verification must never exercise a published/remote GHCR image: build
+# + load locally first (make build) and pass the local tag. Reject anything that
+# looks like a registry reference or is absent from the local daemon.
+require_local_image "$WORDPRESS_IMAGE"
+
 TMPDIR_HOST="$(mktemp -d)"
 WP_CLI_HOST="$TMPDIR_HOST/wp-cli.phar"
 

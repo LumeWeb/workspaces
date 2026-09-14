@@ -3,7 +3,13 @@ name: pinner-php-caddy-local
 
 services:
   web:
-    image: ${PHP_CADDY_IMAGE:-ghcr.io/lumeweb/pinner-php-caddy:0.1.0}
+    # Local-only verification image: `make build` produces and loads this tag.
+    # It is NOT a registry reference, so `docker compose up` here never tries to
+    # pull a (private, authenticated) GHCR image. The verification script always
+    # sets PHP_CADDY_IMAGE from the built local tag; this fallback just keeps a
+    # bare `docker compose up` fail-closed against the locally built image
+    # instead of drifting to a published GHCR pull.
+    image: ${PHP_CADDY_IMAGE:-pinner-php-caddy:local}
     # Local-only credentials mirroring the portal's WORKSPACE_AUTH_* secret env
     # injection (portal-plugin-ipfs PR #1031). The image fails closed without
     # both; the container's own loopback /healthz healthcheck bypasses auth.
