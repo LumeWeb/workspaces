@@ -1,0 +1,14 @@
+# Build context hygiene: keep image builds deterministic and slim.
+.git
+.github
+.gitignore
+compose
+scripts
+docs
+*.md
+LICENSE
+.env
+.env.*
+*.tar
+*.zip
+*.deb

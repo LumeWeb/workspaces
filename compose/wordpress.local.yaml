@@ -1,0 +1,80 @@
+# Local verification stack for the Pinner WordPress image.
+#
+# Mirrors the portal contract exactly:
+#   - WordPress image already built (WORDPRESS_IMAGE), run behind Caddy on 8080
+#   - external MariaDB (persistent, digest-pinned)
+#   - the three persistent volumes mounted at the exact portal paths
+#   - WORDPRESS_DB_* and PORTAL_WORKSPACE_URL env, like the portal injects
+#
+# NOTE: `build:` is intentionally omitted. Use `make verify-wordpress` (or
+# `make build-wordpress` first) so the image is produced by docker-bake, then
+# this file simply consumes WORDPRESS_IMAGE. This keeps bake the single
+# source of truth for how images are assembled.
+name: workspace-wordpress-local
+
+services:
+  db:
+    image: mariadb:11.4@sha256:80494b9810694179889f7281ec44ca928241df577159c0356a1070e2e94616a1
+    environment:
+      MARIADB_ROOT_PASSWORD: local-root
+      MARIADB_DATABASE: wp
+      MARIADB_USER: wp
+      MARIADB_PASSWORD: wp-pass
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    restart: "no"
+
+  wordpress:
+    # Local-only verification image: `make build-wordpress` produces and loads
+    # this tag. It is NOT a registry reference, so `docker compose up` here
+    # never pulls a (private, authenticated) GHCR image. The verification
+    # scripts always set WORDPRESS_IMAGE from the built local tag; this fallback
+    # just keeps a bare `docker compose up` fail-closed against the locally
+    # built image instead of drifting to a published GHCR pull.
+    image: ${WORDPRESS_IMAGE:-workspace-wordpress:local}
+    environment:
+      PORT: "8080"
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_PORT: "3306"
+      WORDPRESS_DB_NAME: wp
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wp-pass
+      # Public URL seen by WordPress; the container honours X-Forwarded-* too.
+      PORTAL_WORKSPACE_URL: http://localhost:${HOST_PORT:-8080}
+      # Workspace HTTP Basic Auth (portal-plugin-ipfs PR #1031) enforced by the
+      # base image's Caddy on non-loopback requests. Loopback health bypasses.
+      WORKSPACE_AUTH_USERNAME: localuser
+      WORKSPACE_AUTH_PASSWORD: localpass
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - wordpress-themes:/var/www/html/wp-content/themes
+      - wordpress-plugins:/var/www/html/wp-content/plugins
+      - wordpress-uploads:/var/www/html/wp-content/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Same PHP-backed /healthz route as the Dockerfile HEALTHCHECK. CMD-SHELL
+      # form so the container's PORT env is honoured: $$ escapes the compose
+      # interpolation, and the container shell resolves {PORT:-8080} at runtime.
+      # curl -f fails on any non-2xx.
+      test: ["CMD-SHELL", "curl -fsS \"http://localhost:$${PORT:-8080}/healthz\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: "no"
+
+volumes:
+  db-data:
+  wordpress-themes:
+  wordpress-plugins:
+  wordpress-uploads:

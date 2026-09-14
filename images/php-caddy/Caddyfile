@@ -1,0 +1,56 @@
+# Pinner runtime entrypoint for Caddy.
+#
+# Serves the application from the configurable document root (default
+# /var/www/html) on 0.0.0.0:${PORT}. /healthz is a dedicated PHP-backed probe
+# proving the PHP-FPM backend is alive.
+#
+# Workspace HTTP Basic Auth (portal-plugin-ipfs PR #1031): the Pinner portal
+# injects WORKSPACE_AUTH_USERNAME / WORKSPACE_AUTH_PASSWORD as secret
+# environment variables, and the workspace image enforces auth on public
+# (non-loopback) requests. docker-entrypoint.sh derives a bcrypt hash from the
+# password at startup and exports it as WORKSPACE_AUTH_HASH; this file
+# substitutes that value here via {$WORKSPACE_AUTH_HASH}. The plaintext secret
+# is never baked into the image, written to disk, or echoed to logs — it lives
+# only transiently in the process environment.
+#
+# Loopback exemption: direct requests whose real peer IP is 127.0.0.1 or ::1
+# bypass auth so the container's own Docker/Coolify health probe
+# (curl localhost:${PORT}/healthz) passes without credentials. The bypass keys
+# on the actual TCP peer via Caddy's remote_ip matcher — NEVER on spoofable
+# X-Forwarded-For / X-Real-IP headers, which this matcher ignores by default.
+#
+# TLS is terminated by the upstream Coolify proxy, so this Caddy is plain HTTP
+# on PORT. Requests land on the container's published port only.
+:{$PORT:8080} {
+	root * /var/www/html
+	encode gzip
+
+	# Enforce HTTP Basic Auth on every non-loopback request (including
+	# /healthz): the health path is only ever probed from localhost by the
+	# container health check, so a non-loopback /healthz is just another
+	# gated route. The username and derived hash names are provided by the
+	# auth setup step; missing/invalid WORKSPACE_AUTH_* fails the container
+	# at start, so this block is always populated when Caddy runs.
+	@external not remote_ip 127.0.0.1 ::1
+	basicauth @external {
+		{$WORKSPACE_AUTH_USERNAME} {$WORKSPACE_AUTH_HASH}
+	}
+
+	# PHP-backed health: routes /healthz to healthz.php through PHP-FPM, so a
+	# 200 from this path proves PHP handling rather than a static file.
+	# A terminating handle keeps it independent of the app route below.
+	#
+	# Note: php_fastcgi takes `[<matcher>] <gateway...>`, so a bare `php` token
+	# here would be parsed as an extra upstream host and Caddy would try to dial
+	# a host named "php". Pass exactly one, real gateway and no matcher.
+	handle /healthz* {
+		rewrite * /healthz.php
+		php_fastcgi 127.0.0.1:9000
+	}
+
+	# Standard Caddy PHP recipe: php_fastcgi already restricts its proxy to
+	# *.php files (path matcher) and rewrites pretty permalinks to index.php;
+	# file_server serves the remaining static assets.
+	php_fastcgi 127.0.0.1:9000
+	file_server
+}

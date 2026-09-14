@@ -1,0 +1,11 @@
+# Local/tooling artifacts
+*.tar
+*.zip
+*.phar
+*.deb
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+.debug/
