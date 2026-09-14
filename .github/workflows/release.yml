@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: lumeweb
+
+jobs:
+  release:
+    name: Build + publish (amd64/arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Derive recipe version
+        id: version
+        run: echo "recipe=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        run: |
+          # VERSION is a bake HCL variable (read from the process environment),
+          # so set it here: it drives both the `:${VERSION}` image tags and the
+          # build-arg/label sourced from it. Setting only `--set *.args.VERSION`
+          # would leave the release tags stuck at the bake default (0.1.0).
+          VERSION="${{ steps.version.outputs.recipe }}" docker buildx bake --push \
+            --set '*.platform=linux/amd64,linux/arm64' \
+            php-caddy wordpress
+      - name: Report digests
+        run: |
+          docker buildx imagetools inspect "$REGISTRY/$IMAGE_OWNER/pinner-wordpress:${{ steps.version.outputs.recipe }}"

@@ -1,0 +1,25 @@
+# Local verification stack for the php-caddy base image.
+name: pinner-php-caddy-local
+
+services:
+  web:
+    image: ${PHP_CADDY_IMAGE:-ghcr.io/lumeweb/pinner-php-caddy:0.1.0}
+    # Local-only credentials mirroring the portal's WORKSPACE_AUTH_* secret env
+    # injection (portal-plugin-ipfs PR #1031). The image fails closed without
+    # both; the container's own loopback /healthz healthcheck bypasses auth.
+    environment:
+      WORKSPACE_AUTH_USERNAME: localuser
+      WORKSPACE_AUTH_PASSWORD: localpass
+    ports:
+      - "${HOST_PORT:-8081}:8080"
+    healthcheck:
+      # Same PHP-backed /healthz route as the Dockerfile HEALTHCHECK. CMD-SHELL
+      # form so the container's PORT env is honoured: $$ escapes the compose
+      # interpolation, and the container shell resolves {PORT:-8080} at runtime.
+      # curl -f fails on any non-2xx.
+      test: ["CMD-SHELL", "curl -fsS \"http://localhost:$${PORT:-8080}/healthz\""]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: "no"
