@@ -55,6 +55,28 @@ Secret hygiene: the plaintext password is fed to `caddy hash-password` on
 bcrypt hash is carried transiently in the process environment. Credentials and
 hashes are never written to disk or echoed to logs.
 
+## Trusted upstream proxy (forwarded headers)
+
+The workspace always sits behind the upstream Coolify proxy, which terminates
+TLS and connects to this Caddy in plain HTTP over a private network. Caddy's
+default is to treat incoming `X-Forwarded-*` as spoofable and overwrite
+`X-Forwarded-Proto` with its own observed scheme (`http`), so the application
+would never learn the original request was HTTPS. The Caddyfile therefore sets
+the global `servers > trusted_proxies static private_ranges` option: requests
+from the private-network proxy are trusted and their forwarded headers
+(`X-Forwarded-Proto` / `X-Forwarded-Host`) reach the application unmodified.
+This keeps WordPress `is_ssl()` correct behind TLS termination and avoids the
+`force_ssl_admin()` login redirect loop. The trust setting does **not** relax
+the Basic Auth bypass, which continues to key on the real peer IP (`remote_ip`),
+never on forwarded headers.
+
+`private_ranges` is as narrow as a generic image can be pinned to: the upstream
+proxy's source IP varies per deployment (Docker bridge / overlay network), so an
+exact proxy CIDR cannot be known at build time. Trusting all private-range peers
+is an accepted risk: an attacker would need to already sit on the deployment's
+private network, and the forwarded headers only influence scheme/host
+derivation in the application — never authorization.
+
 ## Health
 
 `GET /healthz` returns `200` and is routed **through PHP-FPM** (`healthz.php`),
