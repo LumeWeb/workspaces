@@ -70,6 +70,13 @@ This keeps WordPress `is_ssl()` correct behind TLS termination and avoids the
 the Basic Auth bypass, which continues to key on the real peer IP (`remote_ip`),
 never on forwarded headers.
 
+`private_ranges` is as narrow as a generic image can be pinned to: the upstream
+proxy's source IP varies per deployment (Docker bridge / overlay network), so an
+exact proxy CIDR cannot be known at build time. Trusting all private-range peers
+is an accepted risk: an attacker would need to already sit on the deployment's
+private network, and the forwarded headers only influence scheme/host
+derivation in the application — never authorization.
+
 ## Health
 
 `GET /healthz` returns `200` and is routed **through PHP-FPM** (`healthz.php`),

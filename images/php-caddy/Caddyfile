@@ -27,6 +27,13 @@
 # undetectable → infinite login redirect loop. Trust the private-network peer
 # so the proxy's forwarded headers reach the application intact; X-Forwarded-*
 # are still never used for the auth bypass above (that keys on remote_ip).
+#
+# private_ranges is as narrow as a generic image can get: the upstream proxy's
+# source IP varies per deployment (Podman/Docker bridge, overlay network), so
+# the exact CIDR cannot be pinned at build time. Trusting all private peers is
+# an accepted risk: exploiting it means forging X-Forwarded-Proto/Host on a
+# request that ALREADY originates from inside the deployment's private network,
+# and the headers only influence scheme/host derivation, never authorization.
 {
 	servers {
 		trusted_proxies static private_ranges
