@@ -19,6 +19,20 @@
 # on the actual TCP peer via Caddy's remote_ip matcher — NEVER on spoofable
 # X-Forwarded-For / X-Real-IP headers, which this matcher ignores by default.
 #
+# The workspace always runs behind the upstream Coolify proxy, which terminates
+# TLS and forwards plain HTTP on a private network. Caddy by default treats
+# incoming X-Forwarded-* values as spoofable and overwrites X-Forwarded-Proto
+# with its own (http) scheme, so the application would never see the original
+# https — behind a HTTPS siteurl this makes WordPress force_ssl_admin → ssl
+# undetectable → infinite login redirect loop. Trust the private-network peer
+# so the proxy's forwarded headers reach the application intact; X-Forwarded-*
+# are still never used for the auth bypass above (that keys on remote_ip).
+{
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
 # TLS is terminated by the upstream Coolify proxy, so this Caddy is plain HTTP
 # on PORT. Requests land on the container's published port only.
 :{$PORT:8080} {
