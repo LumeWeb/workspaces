@@ -7,6 +7,7 @@ built on the `php-caddy` base. Uses official WordPress conventions.
 |---|---|
 | Base | `php-caddy` (`php:8.5.10-fpm-bookworm` + Caddy `2.11.4`) |
 | WordPress | `7.1` (archive sha256 verified) |
+| WP-CLI | `2.12.0` (baked in, sha512 verified) |
 | Immutable source | `/usr/src/wordpress` |
 | Runtime docroot | `/var/www/html` (ephemeral) |
 | Listen | `0.0.0.0:${PORT:-8080}` |
@@ -14,12 +15,14 @@ built on the `php-caddy` base. Uses official WordPress conventions.
 
 ## Version pins — single source of truth
 
-The WordPress version/sha256 live **only** in `images/wordpress/versions.env`
-(the PHP/Caddy pins live in `images/php-caddy/versions.env`). `docker-bake.hcl`
-injects them into the Docker ARGs and OCI labels; the `Dockerfile` declares those
-ARGs **without hardcoded literals**, so there is no second copy to drift. Bump by
-editing `versions.env`, then run `make deps-verify` (which asserts bake forwards
-the same values) and rebuild.
+The WordPress version/sha256, the WP-CLI version/sha512, and the Go builder
+image (name + digest for the `workspace-init` CLI) live **only** in
+`images/wordpress/versions.env` (the PHP/Caddy pins live in
+`images/php-caddy/versions.env`). `docker-bake.hcl` injects them into the Docker
+ARGs and OCI labels; the `Dockerfile` declares those ARGs **without hardcoded
+literals**, so there is no second copy to drift. Bump by editing `versions.env`,
+then run `make deps-verify` (which re-checks the WP-CLI phar checksum and asserts
+bake forwards the same values) and rebuild.
 
 ## Persistence contract
 
@@ -61,39 +64,63 @@ Runs as root (via the base `PINNER_INIT` hook) before privileges are dropped:
 
 1. **Seed core** — copy immutable `/usr/src/wordpress` → ephemeral docroot
    (skipping `wp-content`).
-2. **Generate `wp-config.php`** — delegated to a dedicated PHP generator
-   (`/usr/local/bin/wp-config-generator`, installed by the Dockerfile and run
-   here as root) that reads `WORDPRESS_DB_*` + `PORTAL_WORKSPACE_URL` directly
-   from the environment and writes the file atomically via a private **0600**
-   temp file it renames into place. After generation the init chowns it to
-   `www-data` (owner-only read; never world-readable).
+2. **Fail closed on missing DB** — if `WORDPRESS_DB_HOST` is unset the init
+   exits non-zero (a WordPress workspace without a DB is a real
+   misconfiguration; we refuse to boot broken).
 3. **Seed `themes` and `plugins`** from `/usr/src/wordpress/wp-content` onto the
    mounted volumes (copy-based, never symlinks), so the default theme and
    bundled plugins appear on a brand-new shadowing volume.
 4. **Leave `uploads` unseeded** (user media only).
-5. **Ownership** — repair root-owned mount roots; only recursive-chown when the
+5. **Generate `wp-config.php`** with WP-CLI `wp config create` as `www-data`
+   (mode **0600**, owner-only read; DB password + proxy/URL extra PHP travel on
+   stdin, never argv).
+6. **Automatic bootstrap** — wait (bounded) for the DB, then on first boot run
+   `wp core install --url=$COOLIFY_URL` with the owner email (fetched from the
+   portal by the baked-in `workspace-init` CLI) and the existing
+   `WORKSPACE_AUTH_*` credentials; on every boot converge the admin password to
+   the current `WORKSPACE_AUTH_PASSWORD`. A DB that is merely down, or a portal
+   that cannot supply the email, defers install to a later boot with a clear
+   warning rather than inventing a bogus admin email.
+7. **Ownership** — repair root-owned mount roots; only recursive-chown when the
    mount root is not already owned by `www-data`.
 
-### `wp-config.php` generation
+### `wp-config.php` generation (`wp config create`)
 
-- **Safe serialization** — every value (DB name/user/password, `host:port`,
-  table prefix, `WP_HOME`/`WP_SITEURL`) is emitted with PHP `var_export()`, so
-  quotes, backslashes, dollar signs, newlines and non-ASCII bytes round-trip
-  exactly and can never break out of (or into) a generated literal. No shell
-  interpolation is used and **no secret ever appears on `argv` or in logs**.
-- **No WP-CLI, no DB connection** — generation never touches the database, so
-  it works while the DB is still down at boot.
-- **Host/port** — a `:port` already on `WORDPRESS_DB_HOST` is honoured;
+Uses the **WP-CLI baked into the image** (`/usr/local/bin/wp`, pinned) rather
+than a custom generator:
+
+- **Secret-safe** — the DB password travels on stdin via `--prompt=dbpass` (and
+  the admin password via `--prompt=admin_password` on `wp core install`), so
+  **no secret ever appears on `argv`, in process listings, or in logs**. WP-CLI
+  runs as `www-data` via `setpriv`, never as root.
+- **Mode 0600** — an empty `wp-config.php` is pre-created as `www-data` (0600)
+  before the WP-CLI call and re-`chown`ed/`chmod`ed to 0600 `www-data`
+  afterwards (owner-only read; never world-readable).
+- **DB host/port** — a `:port` already on `WORDPRESS_DB_HOST` is honoured;
   `WORDPRESS_DB_PORT` is appended only when the host has no port.
-- **Proxy/URL** — `PORTAL_WORKSPACE_URL` sets `WP_HOME`/`WP_SITEURL`; the
+- **Proxy/URL** — `COOLIFY_URL` (the public URL) sets `WP_HOME`/`WP_SITEURL`
+  via `--extra-php` (single-quote-safe `var_export` literal for URL values); the
   standard `X-Forwarded-Proto`/`X-Forwarded-Host` HTTPS block is preserved.
-- **Missing DB env is non-fatal** — if `WORDPRESS_DB_HOST` is unset the
-  generator prints a warning and exits 0 without creating the file, so an image
-  booted without DB config still starts (diagnostics). Once configured it
-  regenerates on every start and the config stays ephemeral.
-- **Salts** are generated fresh per boot. `WP_CACHE_KEY_SALT` is intentionally
-  *not* set (no persistent object cache; the whole config is ephemeral), which
-  preserves prior behaviour.
+- **`--skip-check`** lets config generation complete while the DB is still
+  coming up; salts are generated fresh by WP-CLI. `WP_CACHE_KEY_SALT` is
+  intentionally *not* set (the whole config is ephemeral, no persistent object
+  cache).
+- Config is **ephemeral**: regenerated every start.
+
+### Automatic bootstrap (`wp core install` + password converge)
+
+- **First boot** — after the bounded DB wait, `workspace-init` (the baked-in Go
+  CLI) exchanges `PORTAL_API_KEY` for a login-purpose JWT via `POST /api/auth/key`,
+  then reads the owner email via `GET /api/account`; `wp-init.sh` runs
+  `wp core install --url=$COOLIFY_URL --admin_email=$email --skip-email` with the
+  existing `WORKSPACE_AUTH_USERNAME`/`PASSWORD`.
+- **Every boot** — `converge_admin_password` updates the WordPress admin
+  password to the current `WORKSPACE_AUTH_PASSWORD`, so portal credential
+  rotation takes effect on redeploy.
+- **Safe fallback** — if the DB is down past the bound, or the portal cannot
+  supply the owner email, install is **deferred to the next boot with a warning**
+  (never an invented email). The container still starts healthy (`/healthz` is
+  WP-independent).
 
 ### Seeding policy
 
@@ -119,13 +146,17 @@ to plugins/themes survive recreation.
 | `WORDPRESS_DB_USER` | DB user |
 | `WORDPRESS_DB_PASSWORD` | DB password (secret) |
 | `WORDPRESS_TABLE_PREFIX` | Table prefix (default `wp_`) |
-| `PORTAL_WORKSPACE_URL` | Public HTTPS URL → `WP_HOME`/`WP_SITEURL` |
-| `WORKSPACE_AUTH_USERNAME` | HTTP Basic Auth username (secret, enforced by the base Caddy) |
-| `WORKSPACE_AUTH_PASSWORD` | HTTP Basic Auth password (secret, enforced by the base Caddy) |
+| `COOLIFY_URL` | Public URL → `WP_HOME`/`WP_SITEURL` and `wp core install --url` |
+| `PORTAL_API_URL` | Portal API base URL (used by `workspace-init` to fetch the owner email) |
+| `PORTAL_API_KEY` | Portal workspace API key (secret, used by `workspace-init`) |
+| `WORKSPACE_AUTH_USERNAME` | HTTP Basic Auth username **and** bootstrap WordPress admin user (secret, enforced by the base Caddy) |
+| `WORKSPACE_AUTH_PASSWORD` | HTTP Basic Auth password **and** bootstrap WordPress admin password, converged every boot (secret, enforced by the base Caddy) |
+| `WP_SITE_TITLE` | WordPress site title passed to `wp core install` (default `Pinner Workspace`) |
+| `WP_DB_WAIT_TRIES` / `WP_DB_WAIT_INTERVAL` | Bounded DB-wait retries / sleep seconds (defaults `90` / `2`) |
 | `PORT` | HTTP listen port (default `8080`) |
 
 No numeric workspace-ID env is consumed: the container identifies itself to
-the portal via `COOLIFY_RESOURCE_UUID` + `PORTAL_API_KEY`.
+the portal via `PORTAL_API_KEY` / `COOLIFY_URL`.
 
 ## HTTP Basic Auth
 
@@ -162,6 +193,9 @@ to run as root somewhere.
 make verify-wordpress
 ```
 
-Proves PHP-backed health, WordPress install, fresh-volume default theme,
-persistence across container recreation, ephemeral core, non-overwrite of user
-content, runtime-user writability, and non-root final processes.
+Proves PHP-backed health, the image's **automatic first-boot install** (owner
+email from a mock portal + `COOLIFY_URL`), **per-boot admin password rotation**,
+fresh-volume default theme, persistence across container recreation, ephemeral
+core, non-overwrite of user content, runtime-user writability, and non-root
+final processes. Verification uses the WP-CLI and `workspace-init` **baked into
+the image** — no external downloads.

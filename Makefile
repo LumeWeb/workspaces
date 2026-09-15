@@ -37,11 +37,13 @@ include images/php-caddy/versions.env
 include images/wordpress/versions.env
 export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
        CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
-       WORDPRESS_VERSION WORDPRESS_SHA256
+       WORDPRESS_VERSION WORDPRESS_SHA256 \
+       WP_CLI_VERSION WP_CLI_SHA512 \
+       GO_BASE GO_BASE_DIGEST
 
 .PHONY: help build build-php-caddy build-wordpress \
         lint shellcheck hadolint \
-        verify verify-php-caddy verify-wp-config-generator verify-wordpress deps-verify verify-pins clean
+        verify verify-php-caddy verify-workspace-init verify-wordpress deps-verify verify-pins clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
@@ -81,15 +83,14 @@ hadolint: ## Hadolint all Dockerfiles (skips if not installed)
 
 ## -- verification ---------------------------------------------------------
 
-verify: build verify-php-caddy verify-wp-config-generator verify-wordpress ## Build and run the full local verification matrix
+verify: build verify-php-caddy verify-workspace-init verify-wordpress ## Build and run the full local verification matrix
 
 verify-php-caddy: build-php-caddy ## Verify the php-caddy base image locally
 	bash scripts/verify-php-caddy.sh --image $(PHP_CADDY_IMAGE)
 
-# Focused unit checks for the PHP wp-config generator (special chars, host/port,
-# URL/proxy, 0600 perms, idempotence, missing-env, no secret in argv/logs).
-verify-wp-config-generator: build-wordpress
-	WORDPRESS_IMAGE=$(WORDPRESS_IMAGE) bash scripts/verify-wp-config-generator.sh
+# Unit tests for the workspace-init Go CLI (portal API-key exchange -> email).
+verify-workspace-init:
+	cd images/wordpress/workspace-init && gofmt -l . && go vet ./... && go test ./...
 
 verify-wordpress: build-wordpress ## Verify the WordPress image locally (Compose + MariaDB)
 	WORDPRESS_IMAGE=$(WORDPRESS_IMAGE) bash scripts/verify-wordpress.sh

@@ -1,10 +1,15 @@
 #!/bin/bash
 # End-to-end local verification of the Pinner WordPress image with MariaDB.
 #
-# Proves: PHP-backed health, WordPress install, fresh-volume default theme,
-# persistence of user content across container recreation, ephemeral core,
-# non-overwrite of user content, deleted-plugin-not-resurrected, runtime-user
-# writability, and non-root final processes.
+# Proves: the image's automatic first-boot `wp core install` (owner email from
+# the portal mock + COOLIFY_URL), per-boot admin password rotation, PHP-backed
+# health, fresh-volume default theme, persistence of user content across
+# container recreation, ephemeral core, non-overwrite of user content,
+# deleted-plugin-not-resurrected, runtime-user writability, and non-root final
+# processes.
+#
+# Uses the WP-CLI + workspace-init CLI baked into the image (no external
+# downloads).
 #
 # Usage: WORDPRESS_IMAGE=<image> verify-wordpress.sh
 set -euo pipefail
@@ -24,10 +29,13 @@ SITE_URL="http://localhost:${HOST_PORT}"
 AUTH_USER="localuser"
 AUTH_PASS="localpass"
 
-# wp-cli pinned for deterministic verification (not shipped in the image).
-WP_CLI_VERSION="2.12.0"
-WP_CLI_SHA512="be928f6b8ca1e8dfb9d2f4b75a13aa4aee0896f8a9a0a1c45cd5d2c98605e6172e6d014dda2e27f88c98befc16c040cbb2bd1bfa121510ea5cdf5f6a30fe8832"
-WP_CLI_URL="https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar"
+# The owner email returned by the mock portal (scripts/mock-portal.py); the
+# baked-in workspace-init CLI must have fetched exactly this during install.
+OWNER_EMAIL="owner@example.test"
+
+# Credential-rotation test: the converge step must flip the WordPress admin
+# password to this on a later boot.
+ROTATE_PASS="rotated-pass"
 
 : "${WORDPRESS_IMAGE:?set WORDPRESS_IMAGE to the built WordPress image}"
 
@@ -36,28 +44,17 @@ WP_CLI_URL="https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION
 # looks like a registry reference or is absent from the local daemon.
 require_local_image "$WORDPRESS_IMAGE"
 
-TMPDIR_HOST="$(mktemp -d)"
-WP_CLI_HOST="$TMPDIR_HOST/wp-cli.phar"
-
-trap 'docker compose -f compose/wordpress.local.yaml down -v >/dev/null 2>&1 || true; rm -rf "$TMPDIR_HOST" 2>/dev/null || true' EXIT
+trap 'docker compose -f compose/wordpress.local.yaml down -v >/dev/null 2>&1 || true' EXIT
 
 wp_container() {
     $COMPOSE ps -q "$SERVICE"
 }
 
-# Copy the pinned wp-cli into the currently running app container.
-install_wpcli() {
-    [ -f "$WP_CLI_HOST" ] || {
-        echo "== [verify] downloading wp-cli $WP_CLI_VERSION =="
-        curl -fsSL -o "$WP_CLI_HOST" "$WP_CLI_URL"
-        echo "$WP_CLI_SHA512  $WP_CLI_HOST" | sha512sum -c - >/dev/null
-    }
-    docker cp "$WP_CLI_HOST" "$(wp_container):/tmp/wp-cli.phar"
-}
-
-# Run a wp-cli command inside the app container as root (install/verify only).
+# Run a wp-cli command inside the app container using the WP-CLI baked into the
+# image (/usr/local/bin/wp). Verification runs as the container's default user;
+# --allow-root keeps WP-CLI happy if that default is root.
 wp() {
-    docker exec "$(wp_container)" php /tmp/wp-cli.phar --path=/var/www/html "$@"
+    docker exec "$(wp_container)" /usr/local/bin/wp --path=/var/www/html "$@"
 }
 
 wait_app() {
@@ -65,29 +62,34 @@ wait_app() {
     wait_http_auth "$SITE_URL/healthz" 200 "$AUTH_USER" "$AUTH_PASS" 90 3
 }
 
-echo "== [verify] starting stack (MariaDB + WordPress) =="
+echo "== [verify] starting stack (MariaDB + mock-portal + WordPress) =="
 $COMPOSE up -d
 wait_app
-pass "/healthz returns 200 (PHP-backed, pre-install)"
+pass "/healthz returns 200 (PHP-backed)"
 
-echo "== [verify] fresh shadowing volume: uploads unseeded (pre-install) =="
-# Assert BEFORE wp install: WordPress itself creates dated year/month dirs
-# under uploads during install, so emptiness must be proven before any WP write.
+echo "== [verify] automatic first-boot install (image-side) =="
+# The image's wp-init.sh should have run `wp core install` with the owner email
+# fetched from the mock portal and the COOLIFY_URL as the site URL.
+wp core is-installed --allow-root >/dev/null 2>&1 \
+    && pass "WordPress auto-installed on first boot (image wp-init)" \
+    || die "WordPress was NOT auto-installed by the image"
+
+siteurl="$(wp option get siteurl --allow-root)"
+[ "$siteurl" = "$SITE_URL" ] \
+    && pass "siteurl set to COOLIFY_URL ($siteurl)" \
+    || die "siteurl = '$siteurl', expected COOLIFY_URL '$SITE_URL'"
+
+admin_email="$(wp user get "$AUTH_USER" --field=user_email --allow-root)"
+[ "$admin_email" = "$OWNER_EMAIL" ] \
+    && pass "admin '$AUTH_USER' registered with portal owner email ($admin_email)" \
+    || die "admin email = '$admin_email', expected '$OWNER_EMAIL'"
+
+echo "== [verify] fresh shadowing volume: uploads unseeded =="
+# Used to be proven pre-install; install itself does not create dated upload
+# dirs, so a fresh volume is still empty of user media right after boot.
 uploads="$(docker exec "$(wp_container)" sh -c 'ls -A /var/www/html/wp-content/uploads')"
 [ -z "$uploads" ] || die "uploads should be unseeded on fresh volume, found: $uploads"
 pass "uploads starts empty (never seeded by the image)"
-
-install_wpcli
-
-echo "== [verify] installing WordPress =="
-wp core is-installed >/dev/null 2>&1 && installed=1 || installed=0
-if [ "$installed" = "0" ]; then
-    wp core install --url="$SITE_URL" --title="Pinner Test" \
-        --admin_user=admin --admin_password='adminpass' \
-        --admin_email=admin@example.com --skip-email --allow-root >/dev/null
-fi
-wp core is-installed --allow-root
-pass "WordPress installed via wp-cli"
 
 echo "== [verify] fresh-volume default theme + bundled plugins =="
 themes="$(docker exec "$(wp_container)" sh -c 'ls /var/www/html/wp-content/themes')"
@@ -119,7 +121,6 @@ pass "wrote plugin/theme/upload artifacts + ephemeral core marker"
 echo "== [verify] recreating app container (volumes persist) =="
 $COMPOSE up -d --force-recreate "$SERVICE"
 wait_app
-install_wpcli
 
 echo "== [verify] ephemeral core gone, persistent content survived =="
 docker exec "$(wp_container)" sh -c 'test ! -e /var/www/html/.core-marker.txt' \
@@ -153,6 +154,27 @@ docker exec "$(wp_container)" sh -c 'test ! -e /var/www/html/wp-content/plugins/
     && pass "deleted bundled plugin was not resurrected" \
     || die "deleted plugin came back (seeding should be one-time)"
 
+echo "== [verify] per-boot admin password rotation =="
+# Bump WORKSPACE_AUTH_PASSWORD (via compose interpolation) and recreate: the
+# image must converge the WordPress admin password on the next boot. The new
+# password is checked through wp_check_password() with the value carried on
+# docker exec -e (env), never on argv. Note that the same env var drives Caddy's
+# HTTP Basic Auth, so the health-wait must use the rotated password too.
+AUTH_PASS="$ROTATE_PASS"
+VERIFY_WP_PASS="$ROTATE_PASS" $COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+# The new password reaches wp_check_password() via docker exec -e (env), never
+# on argv.
+rot="$(docker exec -e WP_USER="$AUTH_USER" -e VERIFY_PASS="$ROTATE_PASS" "$(wp_container)" \
+    /usr/local/bin/wp --path=/var/www/html --allow-root eval '
+        $u = get_user_by("login", getenv("WP_USER"));
+        if (!$u) { exit(2); }
+        echo wp_check_password(getenv("VERIFY_PASS"), $u->user_pass, $u->ID) ? "match" : "nomatch";
+    ' 2>/dev/null || true)"
+[ "$rot" = "match" ] \
+    && pass "admin password converged to new WORKSPACE_AUTH_PASSWORD" \
+    || die "admin password NOT rotated: got '$rot'"
+
 echo "== [verify] runtime user writability + non-root =="
 want="$(app_uid_of "$(wp_container)")"
 out="$(docker exec -u "$want" "$(wp_container)" sh -c \
@@ -163,7 +185,7 @@ out="$(docker exec -u "$want" "$(wp_container)" sh -c \
 assert_pid1_nonroot "$(wp_container)" "$want"
 assert_nonroot "$(wp_container)" "$want"
 
-echo "== [verify] idempotence: second recreate does not re-seed =="
+echo "== [verify] idempotence: second restart does not re-seed =="
 $COMPOSE restart "$SERVICE" >/dev/null
 wait_app
 docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/themes/twentytwentyfive' \

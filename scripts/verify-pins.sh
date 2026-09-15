@@ -22,7 +22,9 @@ WP_ENV="$SCRIPT_DIR/../images/wordpress/versions.env"
 # path would.
 export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
        CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
-       WORDPRESS_VERSION WORDPRESS_SHA256
+       WORDPRESS_VERSION WORDPRESS_SHA256 \
+       WP_CLI_VERSION WP_CLI_SHA512 \
+       GO_BASE GO_BASE_DIGEST
 
 echo "== [deps] checking Caddy checksums ($CADDY_VERSION) =="
 curl -fsSL -o /tmp/caddy-checksums.txt \
@@ -56,6 +58,21 @@ echo "  ok  PHP ${PHP_VERSION} digest matches upstream"
 echo "== [deps] WordPress ${WORDPRESS_VERSION} =="
 echo "  WordPress archive sha256 is verified at Docker build time (skip here)."
 echo "  pinned: $WORDPRESS_SHA256"
+
+echo "== [deps] checking WP-CLI phar checksum (${WP_CLI_VERSION}) =="
+curl -fsSL -o /tmp/wp-cli.phar \
+    "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar"
+got_wpcli="$(sha512sum /tmp/wp-cli.phar | awk '{print $1}')"
+if [ "$got_wpcli" != "$WP_CLI_SHA512" ]; then
+    echo "FAIL: WP-CLI phar checksum drifted" >&2
+    echo "  expected: $WP_CLI_SHA512" >&2
+    echo "  upstream: $got_wpcli" >&2
+    exit 1
+fi
+echo "  ok  WP-CLI ${WP_CLI_VERSION} sha512 matches upstream"
+
+echo "== [deps] Go builder image pin (${GO_BASE}) =="
+echo "  GO_BASE_DIGEST is verified by the Docker build (FROM ...@digest); pin: $GO_BASE_DIGEST"
 
 # Drift guard: versions.env is the single source of truth, but the Docker build
 # only sees what docker-bake.hcl injects. Verify the resolved bake plan passes
@@ -91,6 +108,10 @@ if command -v docker >/dev/null 2>&1; then
         check_bake php-caddy "Caddy arm64 sha"  CADDY_SHA512_ARM64 "$CADDY_SHA512_ARM64"
         check_bake wordpress "WP version"       WORDPRESS_VERSION  "$WORDPRESS_VERSION"
         check_bake wordpress "WP sha256"        WORDPRESS_SHA256   "$WORDPRESS_SHA256"
+        check_bake wordpress "WP-CLI version"   WP_CLI_VERSION     "$WP_CLI_VERSION"
+        check_bake wordpress "WP-CLI sha512"    WP_CLI_SHA512      "$WP_CLI_SHA512"
+        check_bake wordpress "Go base"          GO_BASE            "$GO_BASE"
+        check_bake wordpress "Go base digest"   GO_BASE_DIGEST     "$GO_BASE_DIGEST"
 
         # Runtime labels must mirror the same single source (they are fed from
         # the same bake variables, so this is cross-checking the mechanism).
@@ -106,6 +127,19 @@ if command -v docker >/dev/null 2>&1; then
             exit 1
         }
         echo "  ok  php-caddy label com.lumeweb.caddy.version == versions.env ($caddy_label)"
+
+        wpcli_label="$(get_json_label wordpress com.lumeweb.wpcli.version)"
+        [ "$wpcli_label" = "$WP_CLI_VERSION" ] || {
+            echo "FAIL: wordpress label com.lumeweb.wpcli.version = '$wpcli_label', versions.env = '$WP_CLI_VERSION'" >&2
+            exit 1
+        }
+        echo "  ok  wordpress label com.lumeweb.wpcli.version == versions.env ($wpcli_label)"
+        gobase_label="$(get_json_label wordpress com.lumeweb.go-builder.base)"
+        [ "$gobase_label" = "$GO_BASE" ] || {
+            echo "FAIL: wordpress label com.lumeweb.go-builder.base = '$gobase_label', versions.env = '$GO_BASE'" >&2
+            exit 1
+        }
+        echo "  ok  wordpress label com.lumeweb.go-builder.base == versions.env ($gobase_label)"
     fi
 else
     echo "WARN: docker not installed — skipping bake drift check." >&2
