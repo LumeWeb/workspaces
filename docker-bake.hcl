@@ -18,9 +18,24 @@ variable "CADDY_VERSION"      { default = "" }
 variable "CADDY_SHA512_AMD64" { default = "" }
 variable "CADDY_SHA512_ARM64" { default = "" }
 
-# wordpress upstream pins (sourced from images/wordpress/versions.env).
-variable "WORDPRESS_VERSION" { default = "" }
-variable "WORDPRESS_SHA256"  { default = "" }
+# wordpress upstream pins (sourced from images/wordpress/versions.env). This
+# also includes the WP-CLI release/checksum baked into the image and the Go
+# builder image (name + digest) used to compile the workspace-init CLI.
+variable "WORDPRESS_VERSION"  { default = "" }
+variable "WORDPRESS_SHA256"   { default = "" }
+variable "WP_CLI_VERSION"     { default = "" }
+variable "WP_CLI_SHA512"      { default = "" }
+variable "GO_BASE"            { default = "" }
+variable "GO_BASE_DIGEST"     { default = "" }
+
+# Publish immutable per-version tags AND a floating `:latest` under the release
+# path. Controlled by the CD release workflow (.github/workflows/release.yml):
+#   - tag push / manual-with-version -> VERSION=recipe and :latest  => ver+latest
+#   - manual without version         -> VERSION="" and :latest      => latest only
+# Local `make build` overrides each target's whole tag list via --set, so this
+# default never affects local verification. Keeping VERSION unset (below) emits
+# NO empty ":<version>" tag and NO bare "name:" tag.
+variable "PUBLISH_LATEST" { default = "true" }
 
 target "_common" {
   args = {
@@ -57,7 +72,10 @@ target "php-caddy" {
     "org.opencontainers.image.base.name"   = PHP_BASE
     "com.lumeweb.caddy.version"            = CADDY_VERSION
   }
-  tags       = ["${REGISTRY}/pinner-php-caddy:${VERSION}"]
+  tags       = concat(
+    VERSION == "" ? [] : ["${REGISTRY}/pinner-php-caddy:${VERSION}"],
+    PUBLISH_LATEST ? ["${REGISTRY}/pinner-php-caddy:latest"] : [],
+  )
 }
 
 # wordpress: WordPress on Caddy/PHP-FPM, layered over php-caddy.
@@ -75,13 +93,23 @@ target "wordpress" {
     VERSION           = VERSION
     WORDPRESS_VERSION = WORDPRESS_VERSION
     WORDPRESS_SHA256  = WORDPRESS_SHA256
+    WP_CLI_VERSION    = WP_CLI_VERSION
+    WP_CLI_SHA512     = WP_CLI_SHA512
+    GO_BASE           = GO_BASE
+    GO_BASE_DIGEST    = GO_BASE_DIGEST
   }
   labels = {
     "org.opencontainers.image.base.digest" = PHP_BASE_DIGEST
     "org.opencontainers.image.base.name"   = PHP_BASE
     "com.lumeweb.wordpress.version"        = WORDPRESS_VERSION
+    "com.lumeweb.wpcli.version"            = WP_CLI_VERSION
+    "com.lumeweb.go-builder.base"          = GO_BASE
+    "com.lumeweb.go-builder.digest"        = GO_BASE_DIGEST
   }
-  tags       = ["${REGISTRY}/workspace-wordpress:${VERSION}"]
+  tags       = concat(
+    VERSION == "" ? [] : ["${REGISTRY}/workspace-wordpress:${VERSION}"],
+    PUBLISH_LATEST ? ["${REGISTRY}/workspace-wordpress:latest"] : [],
+  )
 }
 
 group "default" {

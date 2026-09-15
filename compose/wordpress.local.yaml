@@ -4,7 +4,10 @@
 #   - WordPress image already built (WORDPRESS_IMAGE), run behind Caddy on 8080
 #   - external MariaDB (persistent, digest-pinned)
 #   - the three persistent volumes mounted at the exact portal paths
-#   - WORDPRESS_DB_* and PORTAL_WORKSPACE_URL env, like the portal injects
+#   - WORDPRESS_DB_*, COOLIFY_URL, PORTAL_API_URL/PORTAL_API_KEY and
+#     WORKSPACE_AUTH_* env, like the portal injects
+#   - a tiny mock of the portal auth/account API (scripts/mock-portal.py) so
+#     the baked-in workspace-init CLI can fetch the owner email locally
 #
 # NOTE: `build:` is intentionally omitted. Use `make verify-wordpress` (or
 # `make build-wordpress` first) so the image is produced by docker-bake, then
@@ -13,6 +16,19 @@
 name: workspace-wordpress-local
 
 services:
+  # Local stand-in for the Pinner portal's auth/account API. workspace-init in
+  # the WordPress container calls POST /api/auth/key (exchanging PORTAL_API_KEY
+  # for a login-purpose JWT) and GET /api/account (reading the owner email).
+  # Bind-mount the script so it travels with the repo; no image build needed.
+  mock-portal:
+    image: python:3.13-alpine
+    command: ["python", "/mock-portal.py"]
+    volumes:
+      - ../scripts/mock-portal.py:/mock-portal.py:ro
+    environment:
+      # The mock listens on 0.0.0.0:8081 (see scripts/mock-portal.py).
+      PYTHONUNBUFFERED: "1"
+    restart: "no"
   db:
     image: mariadb:11.4@sha256:80494b9810694179889f7281ec44ca928241df577159c0356a1070e2e94616a1
     environment:
@@ -46,12 +62,22 @@ services:
       WORDPRESS_DB_NAME: wp
       WORDPRESS_DB_USER: wp
       WORDPRESS_DB_PASSWORD: wp-pass
-      # Public URL seen by WordPress; the container honours X-Forwarded-* too.
-      PORTAL_WORKSPACE_URL: http://localhost:${HOST_PORT:-8080}
+      # Public URL seen by WordPress (WP_HOME/WP_SITEURL + wp core install);
+      # the container honours X-Forwarded-* too.
+      COOLIFY_URL: http://localhost:${HOST_PORT:-8080}
+      # The portal API endpoint + API key used by the baked-in workspace-init
+      # CLI to fetch the owner email. The mock portal implements just the two
+      # endpoints that CLI needs.
+      PORTAL_API_URL: http://mock-portal:8081
+      PORTAL_API_KEY: local-portal-api-key
       # Workspace HTTP Basic Auth (portal-plugin-ipfs PR #1031) enforced by the
       # base image's Caddy on non-loopback requests. Loopback health bypasses.
+      # WORKSPACE_AUTH_PASSWORD doubles as the bootstrap WordPress admin
+      # password (see AGENTS.md) and is converged on every boot.
       WORKSPACE_AUTH_USERNAME: localuser
-      WORKSPACE_AUTH_PASSWORD: localpass
+      # Overridable so verify-wordpress.sh can test credential rotation on a
+      # later boot (compose interpolation from the caller's environment).
+      WORKSPACE_AUTH_PASSWORD: ${VERIFY_WP_PASS:-localpass}
     ports:
       - "${HOST_PORT:-8080}:8080"
     volumes:
@@ -61,6 +87,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      mock-portal:
+        condition: service_started
     healthcheck:
       # Same PHP-backed /healthz route as the Dockerfile HEALTHCHECK. CMD-SHELL
       # form so the container's PORT env is honoured: $$ escapes the compose

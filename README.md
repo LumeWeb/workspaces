@@ -15,8 +15,9 @@ The first image is **WordPress served by Caddy on PHP-FPM**, built on a reusable
 | `workspace-wordpress` | WordPress workspace | WordPress `7.1` on the base |
 
 All upstream bases are **pinned**: exact PHP digest, exact Caddy release with
-per-arch sha512, and the exact WordPress archive sha256. No floating
-production `latest` tag.
+per-arch sha512, and the exact WordPress archive sha256. Releases additionally
+publish a floating `:latest` tag (see [Versioning / releases](#versioning--releases)),
+always alongside an immutable per-version tag when a version is known.
 
 ## Pinning / single source of truth
 
@@ -24,7 +25,9 @@ Every upstream version, digest, and checksum lives in exactly **one** place —
 the `versions.env` files:
 
 - `images/php-caddy/versions.env` → PHP base + Caddy version and per-arch sha512
-- `images/wordpress/versions.env` → WordPress version and archive sha256
+- `images/wordpress/versions.env` → WordPress version + archive sha256, and the
+  WP-CLI version + sha512 and Go builder image (name + digest) baked into the
+  image
 
 The `Makefile` `include`s those files, `export`s the variables, and
 `docker-bake.hcl` reads them back from the process environment. Bake injects the
@@ -143,7 +146,15 @@ it as a named context (`contexts.base = target:php-caddy`).
   on the real peer IP (`remote_ip`), never spoofable forwarding headers; missing
   credentials fail the container closed.
 - DB via `WORDPRESS_DB_HOST/PORT/NAME/USER/PASSWORD`; public URL via
-  `PORTAL_WORKSPACE_URL`; `X-Forwarded-*` drives HTTPS-correct links.
+  `COOLIFY_URL` (sets `WP_HOME`/`WP_SITEURL` and drives `wp core install`);
+  `X-Forwarded-*` drives HTTPS-correct links.
+- **Automatic bootstrap** (image-side): WP-CLI + the `workspace-init` Go CLI are
+  baked in. On first boot `workspace-init` exchanges `PORTAL_API_KEY` for a
+  login-purpose JWT via the portal, reads the owner's email from `GetAccount`,
+  and `wp-init.sh` runs `wp core install --url=$COOLIFY_URL` with the owner
+  email and the existing `WORKSPACE_AUTH_*` credentials. Every boot converges
+  the WordPress admin password to the current `WORKSPACE_AUTH_PASSWORD`. No
+  portal or dashboard code changes.
 
 ## How persistence + root-owned volumes work
 
@@ -154,10 +165,14 @@ WordPress entrypoint therefore runs **as root first**:
 1. Seeds WordPress core into the ephemeral docroot from `/usr/src/wordpress`.
 2. One-time **copy-based** seed of `themes` and `plugins` from the immutable
    source onto their mounted volumes (uploads is never seeded).
-3. Repairs ownership — recursive `chown` only when the mount root is not
+3. Generates an ephemeral `wp-config.php` with WP-CLI `wp config create`
+   (DB/secret values on stdin), then runs the automatic first-boot
+   `wp core install` (owner email from the portal via the baked-in
+   `workspace-init` CLI) and converges the admin password on every boot.
+4. Repairs ownership — recursive `chown` only when the mount root is not
    already owned by `www-data` (avoids reapplying recursive chown on large
    `uploads` volumes every boot).
-4. Permanently **drops to `www-data`** via `setpriv`, then starts Caddy +
+5. Permanently **drops to `www-data`** via `setpriv`, then starts Caddy +
    PHP-FPM as non-root.
 
 Seeding is `flock`-serialized and idempotent: interrupted or concurrent first
@@ -183,7 +198,11 @@ isn't loaded locally, they fail with a clear error instead of pulling — a loca
 `make verify-wordpress` boots WordPress + MariaDB via Compose and proves:
 
 - PHP-backed `/healthz` returns `200`
-- WordPress installs (wp-cli), default theme activates
+- the image automatically installs WordPress on first boot (owner email from
+  the mock portal, `COOLIFY_URL` as the site URL), and the default theme
+  activates
+- per-boot admin password rotation converges to a changed
+  `WORKSPACE_AUTH_PASSWORD`
 - default theme + bundled plugins appear on a **fresh shadowing volume**
 - uploads starts empty; plugins/themes/uploads **survive container
   recreation**; user content is **not overwritten**
@@ -195,20 +214,25 @@ isn't loaded locally, they fail with a clear error instead of pulling — a loca
 ## Versioning / releases
 
 Images are published with an **immutable, per-release recipe tag** derived from
-the git tag: a pushed tag `vX.Y.Z` publishes `:<X.Y.Z>` (never a floating
-`latest`).
+the git tag, plus a floating `:latest`:
+
+- A pushed tag `vX.Y.Z` publishes `:<X.Y.Z>` **and** `:latest`.
+- A manual (`workflow_dispatch`) run publishes `:<version>` **and** `:latest`
+  when a `version` input is provided.
+- A manual run with the `version` input left **blank** publishes `:latest`
+  only (no empty/invalid version tag is produced).
 
 ```text
-ghcr.io/lumeweb/workspace-wordpress:0.1.0    # from git tag v0.1.0
-ghcr.io/lumeweb/pinner-php-caddy:0.1.0    # from git tag v0.1.0
+ghcr.io/lumeweb/workspace-wordpress:0.1.0 + :latest   # from git tag v0.1.0
+ghcr.io/lumeweb/pinner-php-caddy:0.1.0   + :latest    # from git tag v0.1.0
+ghcr.io/lumeweb/workspace-wordpress:latest            # manual, no version
 ```
 
 `VERSION` (the recipe) in `docker-bake.hcl`/`Makefile`/`release.yml` is the
 `X.Y.Z` component; it drives both the image tags and the build-arg/label sourced
-from it. Releases build `linux/amd64` + `linux/arm64`, publish immutable recipe
-tags, and report digests (see `.github/workflows/release.yml`). A mutable
-`stable` moving tag may be maintained **in addition** to, never instead of,
-immutable tags.
+from it (an empty `VERSION` omits the per-version tag and keeps only `:latest`).
+Releases build `linux/amd64` + `linux/arm64` and report digests against the
+resolved published tag (see `.github/workflows/release.yml`).
 
 ## Portal configuration
 

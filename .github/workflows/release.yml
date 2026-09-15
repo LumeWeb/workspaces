@@ -7,11 +7,13 @@ on:
     inputs:
       version:
         description: |
-          Release version to build and push (e.g. 0.2.0). Required for manual
-          runs; on a tag push the version is derived from the tag (v-prefix
-          stripped) and this input is ignored.
+          Release version to build and push (e.g. 0.2.0). Optional for manual
+          runs: leave blank to publish only the floating `:latest` tag; provide
+          a version to publish both `<version>` and `:latest`. On a tag push the
+          version is derived from the tag (v-prefix stripped) and this input is
+          ignored.
         type: string
-        required: true
+        required: false
 
 env:
   # Registry HOST, used only to authenticate with the GHCR login step.
@@ -48,12 +50,13 @@ jobs:
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Manual run: use the explicit version input. On dispatch GITHUB_REF_NAME
-            # is the branch name, NOT a tag, so we must not fall back to it.
+            # Manual run: use the explicit version input if given. An empty
+            # version publishes only the floating :latest tag. On dispatch
+            # GITHUB_REF_NAME is the branch name, NOT a tag, so we must not fall
+            # back to it.
             recipe="${{ inputs.version }}"
             if [[ -z "$recipe" ]]; then
-              echo "::error::No version provided for manual release. Use the 'version' input (e.g. 0.2.0)." >&2
-              exit 1
+              echo "Manual release with no version: publishing :latest only."
             fi
           else
             # Tag push (v*): derive from the tag, stripping the v-prefix.
