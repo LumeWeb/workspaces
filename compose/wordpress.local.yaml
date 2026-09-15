@@ -24,7 +24,7 @@ services:
     image: python:3.13-alpine
     command: ["python", "/mock-portal.py"]
     volumes:
-      - ./scripts/mock-portal.py:/mock-portal.py:ro
+      - ../scripts/mock-portal.py:/mock-portal.py:ro
     environment:
       # The mock listens on 0.0.0.0:8081 (see scripts/mock-portal.py).
       PYTHONUNBUFFERED: "1"

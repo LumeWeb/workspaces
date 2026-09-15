@@ -69,11 +69,20 @@ RUN set -eux; \
 # a tampered/incorrect download fails the build. Used by wp-init.sh for
 # `wp config create`, `wp core install` and the per-boot admin password
 # converge, so no separate wp-cli download is needed at runtime/verify time.
+# WP-CLI ships as a self-contained phar. We install it as wp-cli.phar and expose
+# a `wp` wrapper that runs it through `php -d error_reporting=22527`, so the
+# deprecation notices WP-CLI's bundled react/promise emits under PHP 8.5 (e.g.
+# "Case statements followed by a semicolon are deprecated") do NOT leak onto
+# stdout and corrupt parsed output such as `wp option get siteurl`.
+# error_reporting=22527 == E_ALL & ~E_DEPRECATED for this PHP (E_ALL=30719).
 RUN set -eux; \
-    curl -fsSL -o /usr/local/bin/wp \
+    curl -fsSL -o /usr/local/bin/wp-cli.phar \
         "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar"; \
-    echo "${WP_CLI_SHA512}  /usr/local/bin/wp" | sha512sum -c -; \
-    chmod +x /usr/local/bin/wp
+    echo "${WP_CLI_SHA512}  /usr/local/bin/wp-cli.phar" | sha512sum -c -; \
+    chmod +x /usr/local/bin/wp-cli.phar; \
+    printf '%s\n' '#!/bin/sh' 'set -eu' \
+        'exec php -d error_reporting=22527 /usr/local/bin/wp-cli.phar "$@"' \
+        > /usr/local/bin/wp && chmod +x /usr/local/bin/wp
 
 # The workspace-init CLI (owner-email helper) from the builder stage above.
 COPY --from=workspace-init-builder /out/workspace-init /usr/local/bin/workspace-init

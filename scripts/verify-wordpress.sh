@@ -85,11 +85,15 @@ admin_email="$(wp user get "$AUTH_USER" --field=user_email --allow-root)"
     || die "admin email = '$admin_email', expected '$OWNER_EMAIL'"
 
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
-# Used to be proven pre-install; install itself does not create dated upload
-# dirs, so a fresh volume is still empty of user media right after boot.
-uploads="$(docker exec "$(wp_container)" sh -c 'ls -A /var/www/html/wp-content/uploads')"
-[ -z "$uploads" ] || die "uploads should be unseeded on fresh volume, found: $uploads"
-pass "uploads starts empty (never seeded by the image)"
+# The image must never seed user media into uploads (wp-init only creates the
+# mount root, see prepare_uploads). WordPress 7.x does create the current
+# year/month upload subdirectory (e.g. 2026/09) at install, but those are EMPTY
+# metadata dirs, not user content — so assert there are no files and no
+# non-empty directories (i.e. no user media), rather than requiring the volume
+# be strictly empty.
+uploads_media="$(docker exec "$(wp_container)" sh -c 'find /var/www/html/wp-content/uploads -mindepth 1 ! -type d | wc -l')"
+[ "$uploads_media" = "0" ] || die "uploads has $uploads_media user files/symlinks on a fresh volume (image must not seed uploads)"
+pass "uploads empty of user media on fresh volume (never seeded by the image)"
 
 echo "== [verify] fresh-volume default theme + bundled plugins =="
 themes="$(docker exec "$(wp_container)" sh -c 'ls /var/www/html/wp-content/themes')"
