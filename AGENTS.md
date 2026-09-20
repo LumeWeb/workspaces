@@ -23,11 +23,11 @@ first image is `wordpress` (WordPress served by Caddy on PHP-FPM).
 - `/healthz` is a dedicated PHP-backed endpoint that returns `200`, reached
   by the container's own Docker/Coolify health check from `localhost`. HTTP
   Basic Auth is enforced **by the image** (Caddy) from the `WORKSPACE_AUTH_*`
-  secret env vars (portal-plugin-ipfs PR #1031) on **non-loopback** requests;
-  loopback requests bypass it via Caddy's `remote_ip` (real peer, never
-  spoofable forwarding headers). Missing/invalid `WORKSPACE_AUTH_*` fails the
-  container closed. Do not weaken this to trust forwarding headers or to add an
-  auth-disabled mode.
+  secret env vars (portal-plugin-ipfs PR #1031) on requests from **external**
+  (public-address) peers; loopback and private-network (RFC1918/ULA) peers
+  bypass it via Caddy's `remote_ip` (real peer, never spoofable forwarding
+  headers). Missing/invalid `WORKSPACE_AUTH_*` fails the container closed. Do
+  not weaken this to trust forwarding headers or to add an auth-disabled mode.
 - Database settings come from `WORDPRESS_DB_HOST/PORT/NAME/USER/PASSWORD`.
 - `COOLIFY_URL` supplies the externally reachable public URL used for
   `WP_HOME`/`WP_SITEURL` and for `wp core install`; `X-Forwarded-*` from the

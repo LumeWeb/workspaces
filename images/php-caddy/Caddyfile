@@ -13,11 +13,21 @@
 # is never baked into the image, written to disk, or echoed to logs — it lives
 # only transiently in the process environment.
 #
-# Loopback exemption: direct requests whose real peer IP is 127.0.0.1 or ::1
-# bypass auth so the container's own Docker/Coolify health probe
-# (curl localhost:${PORT}/healthz) passes without credentials. The bypass keys
-# on the actual TCP peer via Caddy's remote_ip matcher — NEVER on spoofable
-# X-Forwarded-For / X-Real-IP headers, which this matcher ignores by default.
+# Loopback + private-network exemption: direct requests whose real peer IP is
+# 127.0.0.1, ::1, or an RFC1918/ULA private address bypass auth. Loopback
+# covers the container's own Docker/Coolify health probe
+# (curl localhost:${PORT}/healthz). Private ranges cover in-deployment peers
+# that the published-port hairpin NATs (e.g. the bridge gateway when a service
+# inside the deployment's Docker network requests the public URL, as Cast's
+# anonymous export probe and capture fetches do via wp_remote_get(home_url)).
+# Exposing the site to such in-network peers is the existing contract: TLS and
+# public ingress already terminate on a private-network peer (the Coolify
+# proxy), so "protect from the internet" is the threat model, not
+# "protect from the deployment's own network". The bypass keys on the actual
+# TCP peer via Caddy's remote_ip matcher — NEVER on spoofable
+# X-Forwarded-For / X-Real-IP headers, which this matcher ignores by default
+# (trusted_proxies below influences only forwarded-header handling, never the
+# remote_ip matcher).
 #
 # The workspace always runs behind the upstream Coolify proxy, which terminates
 # TLS and forwards plain HTTP on a private network. Caddy by default treats
@@ -46,13 +56,13 @@
 	root * /var/www/html
 	encode gzip
 
-	# Enforce HTTP Basic Auth on every non-loopback request (including
-	# /healthz): the health path is only ever probed from localhost by the
-	# container health check, so a non-loopback /healthz is just another
-	# gated route. The username and derived hash names are provided by the
+	# Enforce HTTP Basic Auth on every request from outside the private
+	# network (including /healthz): the health path is only ever probed from
+	# localhost by the container health check, so a non-exempt /healthz is
+	# just another gated route. The username and derived hash names are provided by the
 	# auth setup step; missing/invalid WORKSPACE_AUTH_* fails the container
 	# at start, so this block is always populated when Caddy runs.
-	@external not remote_ip 127.0.0.1 ::1
+	@external not remote_ip 127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
 	basicauth @external {
 		{$WORKSPACE_AUTH_USERNAME} {$WORKSPACE_AUTH_HASH}
 	}
