@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,7 +29,53 @@ import (
 const (
 	envAPIURL = "PORTAL_API_URL"
 	envAPIKey = "PORTAL_API_KEY"
+
+	// dashboardAPISubdomain is the host subdomain behind which the dashboard
+	// API's key-exchange routes (POST /api/auth/key, GET /api/account) are
+	// routed. It mirrors the value pinned in portal-plugin-ipfs; the dashboard
+	// core package does not export it.
+	dashboardAPISubdomain = "account"
 )
+
+// deriveDashboardAPIURL normalizes the injected PORTAL_API_URL so requests
+// always target the dashboard API host. Older portal deployments inject the
+// bare core domain (e.g. https://pinner.xyz) or this plugin's subdomain
+// (e.g. https://ipfs.pinner.xyz), but the key-exchange routes only exist
+// behind the dashboard's host router (account.<core domain>); hitting any
+// other host yields 405 and skips automatic install. Loopback/IP hosts and
+// hosts already rooted at the dashboard subdomain are returned unchanged.
+// An unparseable URL is returned as-is; the failure then surfaces from the
+// client with full context.
+func deriveDashboardAPIURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+
+	host := strings.ToLower(u.Hostname())
+	// IPs and dotless hosts (e.g. "localhost") have no derivable core domain;
+	// treat them as already-final dev/test targets.
+	if net.ParseIP(host) != nil || !strings.Contains(host, ".") {
+		return rawURL
+	}
+
+	labels := strings.Split(host, ".")
+	if labels[0] == dashboardAPISubdomain {
+		return rawURL
+	}
+
+	// Drop any leftmost plugin subdomain so an apex URL and a subdomain URL
+	// both reduce to the core domain, then prepend the dashboard subdomain:
+	// pinner.xyz / ipfs.pinner.xyz -> account.pinner.xyz.
+	core := strings.Join(labels[len(labels)-2:], ".")
+
+	schemeHost := dashboardAPISubdomain + "." + core
+	if port := u.Port(); port != "" {
+		schemeHost = net.JoinHostPort(schemeHost, port)
+	}
+	u.Host = schemeHost
+	return u.String()
+}
 
 func main() {
 	email, err := fetchEmail(context.Background())
@@ -52,6 +100,11 @@ func fetchEmail(ctx context.Context) (string, error) {
 	if apiKey == "" {
 		return "", fmt.Errorf("%s is required", envAPIKey)
 	}
+
+	// Older portal deployments inject the bare core domain or the plugin's own
+	// subdomain as PORTAL_API_URL; the key-exchange routes only exist behind
+	// the dashboard API's host, so point the client there.
+	apiURL = deriveDashboardAPIURL(apiURL)
 
 	// Bound the whole portal round-trip so a hung/unreachable portal cannot
 	// stall the container's init forever; wp-init treats a failure here as

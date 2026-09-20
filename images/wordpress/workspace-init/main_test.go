@@ -141,8 +141,34 @@ func TestFetchEmailBadCredentials(t *testing.T) {
 	}
 }
 
-// writeJSON sets the JSON content type the oapi-codegen client expects when it
-// decodes a JSON200 body, then encodes v.
+// TestDeriveDashboardAPIURL pins the normalization of the injected
+// PORTAL_API_URL: apex and plugin-subdomain hosts must be rewritten onto the
+// dashboard API host, hosts already at the dashboard subdomain and dev/test
+// loopback targets pass through, and scheme/port are preserved.
+func TestDeriveDashboardAPIURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"apex core domain", "https://pinner.xyz", "https://account.pinner.xyz"},
+		{"plugin subdomain", "https://ipfs.pinner.xyz", "https://account.pinner.xyz"},
+		{"already dashboard host", "https://account.pinner.xyz", "https://account.pinner.xyz"},
+		{"port preserved", "https://ipfs.pinner.xyz:8443", "https://account.pinner.xyz:8443"},
+		{"uppercase host", "https://Pinner.XYZ", "https://account.pinner.xyz"},
+		{"ipv4 passthrough", "http://127.0.0.1:8080", "http://127.0.0.1:8080"},
+		{"localhost passthrough", "http://localhost:3000", "http://localhost:3000"},
+		{"trailing path preserved", "https://pinner.xyz/api", "https://account.pinner.xyz/api"},
+		{"unparseable passthrough", "::::", "::::"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deriveDashboardAPIURL(tc.in); got != tc.want {
+				t.Fatalf("deriveDashboardAPIURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
