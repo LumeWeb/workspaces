@@ -26,18 +26,26 @@ the same values) and rebuild. Verify with `make deps-verify`.
 ## HTTP Basic Auth (portal-plugin-ipfs PR #1031)
 
 The Pinner portal injects two **secret** environment variables, and this image
-enforces them with Caddy's `basicauth` on every **non-loopback** request:
+enforces them with Caddy's `basicauth` on every request from an **external**
+(public-address) peer:
 
 - `WORKSPACE_AUTH_USERNAME`
 - `WORKSPACE_AUTH_PASSWORD`
 
 Behavior:
 
-- **Non-loopback** requests (the actual TCP peer is not `127.0.0.1`/`::1`) must
-  present valid HTTP Basic Auth credentials, otherwise they get `401`.
-- **Loopback** requests (real peer `127.0.0.1` or `::1`) bypass auth, so the
-  container's own Docker/Coolify health probe of `/healthz` passes without
-  credentials. The portal itself never HTTP-probes the workspace URL.
+- **External** requests (the actual TCP peer is a public address) must present
+  valid HTTP Basic Auth credentials, otherwise they get `401`.
+- **Loopback** requests (real peer `127.0.0.1` or `::1`) and **private-network**
+  requests (RFC 1918 / ULA ranges: `10.0.0.0/8`, `172.16.0.0/12`,
+  `192.168.0.0/16`, `fc00::/7`) bypass auth. Loopback covers the container's
+  own Docker/Coolify health probe of `/healthz`. Private-network coverage keeps
+  in-deployment consumers — the Coolify proxy's plain-HTTP hop, and any service
+  inside the deployment's Docker network that requests the workspace's *public*
+  URL and arrives hairpinned through the published port with the bridge
+  gateway as its peer (e.g. Cast's anonymous export probe and capture fetches
+  via `wp_remote_get(home_url('/'))`) — outside "the internet" in the auth
+  threat model. The portal itself never HTTP-probes the workspace URL.
 - The bypass keys on Caddy's `remote_ip` matcher — the **real peer IP**, never
   spoofable `X-Forwarded-For` / `X-Real-IP` headers.
 - **Fail closed**: if either `WORKSPACE_AUTH_*` var is missing/empty at start,
@@ -82,7 +90,7 @@ derivation in the application — never authorization.
 `GET /healthz` returns `200` and is routed **through PHP-FPM** (`healthz.php`),
 so it proves PHP handling, not just a static Caddy file. It is the Docker
 healthcheck path. Because it is reached from localhost, the loopback exemption
-makes it auth-free; a non-loopback `/healthz` is gated like any other route.
+makes it auth-free; an external-peer `/healthz` is gated like any other route.
 
 ## Environment
 

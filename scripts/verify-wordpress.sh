@@ -26,8 +26,9 @@ HOST_PORT="${HOST_PORT:-8080}"
 SITE_URL="http://localhost:${HOST_PORT}"
 
 # Workspace HTTP Basic Auth credentials the compose stack injects
-# (must match compose/wordpress.local.yaml). Host->container requests are
-# non-loopback and therefore require auth; in-container loopback bypasses.
+# (must match compose/wordpress.local.yaml). Loopback and private-network peers
+# bypass auth; requests through the published port carry a private-range peer
+# (docker NAT), which is why host-side requests only ever use credentials.
 AUTH_USER="localuser"
 AUTH_PASS="localpass"
 

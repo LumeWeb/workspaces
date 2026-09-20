@@ -3,12 +3,18 @@
 # the workspace HTTP Basic Auth contract (portal-plugin-ipfs PR #1031), and
 # assert the final Caddy/PHP-FPM processes are non-root.
 #
-# Auth contract under test:
-#   - non-loopback (external-equivalent) requests without credentials -> 401
+# Auth contract under test (the bypass keys on the real TCP peer via Caddy's
+# remote_ip matcher; loopback and private-network peers are in-deployment and
+# exempt — see images/php-caddy/Caddyfile):
+#   - public-range peer without credentials -> 401 (via the TEST-NET-1
+#     ${compose}_publictest network, so the peer is genuinely 192.0.2.x)
 #   - valid credentials -> 200 / app access
 #   - bad credentials -> 401
+#   - private-network peer (RFC1918/ULA) -> 200 with NO credentials
+#     (in-deployment peer: the container's Docker network, and every
+#     published-port hairpin NAT, falls under this case)
 #   - loopback /healthz (127.0.0.1) -> 200 with NO credentials
-#   - spoofed X-Forwarded-For / X-Real-IP never bypass auth on non-loopback
+#   - spoofed X-Forwarded-For / X-Real-IP never bypass auth on a public peer
 #   - IPv6 loopback (::1) bypass -> 200 when the environment supports it
 #   - auth always required (no silent auth-disabled mode): the contract’s
 #     environment builder fails closed, so there is deliberately no
@@ -40,6 +46,18 @@ require_local_image "$IMAGE"
 # php-caddy.local.yaml port mapping below so a custom HOST_PORT works.
 HOST_PORT="${HOST_PORT:-8081}"
 COMPOSE="docker compose -f compose/php-caddy.local.yaml"
+# Networks created by the compose stack: the default bridge (private-range
+# peers) and the TEST-NET-1 bridge (public-range peers).
+PUBLICNET="pinner-php-caddy-local_publictest"
+PRIVATENET="pinner-php-caddy-local_default"
+
+# Run curl with a given real TCP peer network. Uses the built image's own curl
+# with entrypoint overridden, keeping local verification free of extra pulls.
+peer_curl() {
+    net="$1"; shift
+    docker run --rm --network "$net" --entrypoint curl "$IMAGE" -s \
+        -o /dev/null -w '%{http_code}' "$@"
+}
 
 # Credentials the compose stack injects as the WORKSPACE_AUTH_* secrets
 # (must match compose/php-caddy.local.yaml).
@@ -58,26 +76,35 @@ body="$(curl -s -u "$AUTH_USER:$AUTH_PASS" "http://localhost:${HOST_PORT}/health
 [ "$body" = "ok" ] || die "unexpected healthz body: '$body'"
 pass "GET /healthz returns 200 via PHP with valid credentials (body='$body')"
 
-echo "== [php-caddy] external (non-loopback) auth enforcement =="
-code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${HOST_PORT}/healthz")"
-[ "$code" = "401" ] || die "external no-auth expected 401, got $code"
-pass "external-equivalent request without credentials -> 401"
+echo "== [php-caddy] public-range (external) peer auth enforcement =="
+# Requests from a peer on the TEST-NET-1 network carry a public-range TCP peer
+# (192.0.2.x), which is the contract's "external" case: auth required.
+code="$(peer_curl "$PUBLICNET" "http://web:8080/healthz")"
+[ "$code" = "401" ] || die "public-peer no-auth expected 401, got $code"
+pass "public-range peer without credentials -> 401"
 
-code="$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH_USER:wrongpass" "http://localhost:${HOST_PORT}/healthz")"
+code="$(peer_curl "$PUBLICNET" -u "$AUTH_USER:wrongpass" "http://web:8080/healthz")"
 [ "$code" = "401" ] || die "bad credentials expected 401, got $code"
-pass "external request with bad credentials -> 401"
+pass "public-range peer with bad credentials -> 401"
 
-code="$(curl -s -o /dev/null -w '%{http_code}' -u "$AUTH_USER:$AUTH_PASS" "http://localhost:${HOST_PORT}/healthz")"
+code="$(peer_curl "$PUBLICNET" -u "$AUTH_USER:$AUTH_PASS" "http://web:8080/healthz")"
 [ "$code" = "200" ] || die "valid credentials expected 200, got $code"
-pass "external request with valid credentials -> 200"
+pass "public-range peer with valid credentials -> 200"
+
+echo "== [php-caddy] private-network peer bypass =="
+# A peer on the compose default bridge has an RFC1918 TCP peer address: the
+# in-deployment case (includes every published-port hairpin NAT). Exempt.
+code="$(peer_curl "$PRIVATENET" "http://web:8080/healthz")"
+[ "$code" = "200" ] || die "private-peer no-auth expected 200, got $code"
+pass "private-network peer without credentials -> 200"
 
 echo "== [php-caddy] spoofed forwarding headers must not bypass auth =="
 # The bypass keys on Caddy's remote_ip (the real TCP peer of the request). A
-# spoofed X-Forwarded-For/X-Real-IP claiming loopback must NOT exempt an
-# external request, because its actual peer is the docker bridge / non-loopback.
-code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 127.0.0.1' -H 'X-Real-IP: 127.0.0.1' "http://localhost:${HOST_PORT}/healthz")"
+# spoofed X-Forwarded-For/X-Real-IP claiming loopback must NOT exempt a
+# public-range request, because its actual peer is 192.0.2.x.
+code="$(peer_curl "$PUBLICNET" -H 'X-Forwarded-For: 127.0.0.1' -H 'X-Real-IP: 127.0.0.1' "http://web:8080/healthz")"
 [ "$code" = "401" ] || die "spoofed XFF/X-Real-IP must not bypass auth, got $code"
-pass "spoofed X-Forwarded-For/X-Real-IP (claiming loopback) on non-loopback -> 401"
+pass "spoofed X-Forwarded-For/X-Real-IP (claiming loopback) from public peer -> 401"
 
 echo "== [php-caddy] loopback /healthz bypass =="
 # docker exec curl against 127.0.0.1 inside the container: real peer is the

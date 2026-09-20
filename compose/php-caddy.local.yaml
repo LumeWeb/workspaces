@@ -29,3 +29,24 @@ services:
       retries: 30
       start_period: 5s
     restart: "no"
+    networks:
+      # default: private-range peers (the in-deployment auth-exempt case).
+      default: {}
+      # TEST-NET-1 network: gives the verification suite a peer whose real TCP
+      # address is a public-range IP (192.0.2.x), i.e. the auth threat model's
+      # "external" case.
+      publictest:
+        aliases:
+          - web
+
+# Documented so the printed docker inspect is unambiguous: TEST-NET-1 (RFC
+# 5737) is reserved for documentation and should never appear on real public
+# routing, which makes it safe to hand to a local bridge and equally safe for
+# the image's public-peer matcher to treat as external.
+networks:
+  publictest:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          gateway: 192.0.2.1
