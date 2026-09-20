@@ -6,7 +6,9 @@
 # health, fresh-volume default theme, persistence of user content across
 # container recreation, ephemeral core, non-overwrite of user content,
 # deleted-plugin-not-resurrected, runtime-user writability, and non-root final
-# processes.
+# processes. Also proves the workspace lockdown constants (no FS editing, no
+# updates, no web cron) and that the supervised WP-CLI cron worker ticks WP's
+# scheduler.
 #
 # Uses the WP-CLI + workspace-init CLI baked into the image (no external
 # downloads).
@@ -83,6 +85,51 @@ admin_email="$(wp user get "$AUTH_USER" --field=user_email --allow-root)"
 [ "$admin_email" = "$OWNER_EMAIL" ] \
     && pass "admin '$AUTH_USER' registered with portal owner email ($admin_email)" \
     || die "admin email = '$admin_email', expected '$OWNER_EMAIL'"
+
+echo "== [verify] workspace lockdown (no FS edits, no updates, no web cron) =="
+# wp-init.sh bakes these constants into the generated wp-config.php; assert
+# they are LIVE in the generated config (a mere Dockerfile string would pass
+# an image-content grep but not protect the site).
+for c in DISALLOW_FILE_EDIT DISALLOW_FILE_MODS AUTOMATIC_UPDATER_DISABLED DISABLE_WP_CRON; do
+    val="$(wp config get "$c" --type=constant --allow-root)"
+    [ "$val" = "1" ] || die "$c is not enabled in the generated wp-config.php (got: '$val')"
+done
+# WP_AUTO_UPDATE_CORE is defined as boolean false, which wp-cli renders empty;
+# it must simply never enable auto core updates (incl. 'minor'/'major'/'beta').
+upd="$(wp config get WP_AUTO_UPDATE_CORE --type=constant --allow-root)"
+case "$upd" in
+    1|true|minor|major|beta) die "WP_AUTO_UPDATE_CORE enables core updates (got: '$upd')" ;;
+esac
+pass "DISALLOW_FILE_EDIT/MODS, AUTOMATIC_UPDATER_DISABLED, WP_AUTO_UPDATE_CORE, DISABLE_WP_CRON all active"
+
+echo "== [verify] supervised WP-CLI cron worker =="
+# The worker is a third supervised child (PINNER_SUPERVISED_CMD) driving WP's
+# own scheduler via `wp cron event run --due-now` every WP_CRON_INTERVAL. It
+# must be alive, and must run as the non-root app user (the supervisor runs
+# entirely post-privilege-drop).
+wd="$(docker exec "$(wp_container)" sh -c 'for p in /proc/[0-9]*; do grep -aq pinner-wp-cron "$p/cmdline" 2>/dev/null && basename "$p" && break; done')"
+[ -n "${wd:-}" ] || die "pinner-wp-cron worker process not running"
+wd_uid="$(docker exec "$(wp_container)" sed -n "s/^Uid:\([[:space:]]*\)\([0-9]*\).*/\2/p" "/proc/$wd/status")"
+wd_want="$(app_uid_of "$(wp_container)")"
+[ "$wd_uid" = "$wd_want" ] || die "cron worker runs as uid $wd_uid, expected app uid $wd_want"
+pass "cron worker (pinner-wp-cron) supervised and running as uid $wd_want"
+
+# End-to-end proof the worker actually fires: schedule a single event due now;
+# running a single event unschedules it, so the hook vanishing from WP's
+# scheduler proves the worker ticked (a stale worker would never pick it up).
+wp cron event schedule pinner-verify-cron now --allow-root >/dev/null
+ran=0
+i=0
+while [ "$i" -lt 12 ]; do
+    if ! wp cron event get pinner-verify-cron --allow-root >/dev/null 2>&1; then
+        ran=1
+        break
+    fi
+    sleep 5
+    i=$((i + 1))
+done
+[ "$ran" = "1" ] || die "scheduled due cron event never ran (worker is not ticking the scheduler)"
+pass "cron worker ran a scheduled due-now event via WP-CLI"
 
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
