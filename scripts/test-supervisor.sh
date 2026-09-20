@@ -1,24 +1,26 @@
 #!/bin/sh
 # Deterministic regression harness for images/php-caddy/pinner-supervise.sh.
 #
-# The supervisor keeps two co-processes (Caddy + PHP-FPM) alive and must NOT
-# exit when one of them is healthy. This harness proves the reverse requirement
-# — that the supervisor tears down and exits whenever EITHER child fails — plus
-# that a normal docker-stop signal (TERM) still shuts down cleanly with status
-# 0.
+# The supervisor keeps two co-processes (Caddy + PHP-FPM) — plus, when
+# PINNER_SUPERVISED_CMD is exported, one extra accounted worker child (the
+# WordPress cron driver) — alive, and must NOT exit while all are healthy. This
+# harness proves the reverse requirement — that the supervisor tears down and
+# exits whenever ANY child fails — plus that a normal docker-stop signal (TERM)
+# still shuts down cleanly with status 0.
 #
-# It runs the *real* supervisor script against stub `php-fpm` / `caddy`
-# executables placed on PATH (the supervisor invokes both via PATH lookup, so
-# no image build is needed). Each stub records its PID so the harness can later
-# assert the process was terminated AND reaped (an unreaped zombie would still
-# answer to `kill -0`).
+# It runs the *real* supervisor script against stub `php-fpm` / `caddy` /
+# worker executables placed on PATH (the supervisor invokes the built-ins via
+# PATH lookup and the worker via PINNER_SUPERVISED_CMD, so no image build is
+# needed). Each stub records its PID so the harness can later assert the
+# process was terminated AND reaped (an unreaped zombie still answers `kill -0`).
 #
 # Scenarios:
-#   1. php-fpm exits nonzero  -> supervisor exits nonzero (setup: 7)
-#   2. caddy exits nonzero    -> supervisor exits nonzero (setup: 9)
-#   3. TERM while both healthy -> supervisor exits 0, both children cleaned up
-#   4. INT while both healthy  -> supervisor exits 0, both children cleaned up
-#   5. QUIT while both healthy -> supervisor exits 0, both children cleaned up
+#   1. php-fpm exits nonzero  -> supervisor exits nonzero (status: 7)
+#   2. caddy exits nonzero    -> supervisor exits nonzero (status: 9)
+#   3. worker exits nonzero   -> supervisor exits nonzero (status: 11)
+#   4. php-fpm crash, worker healthy -> worker reaped as survivor
+#   5. TERM while all three healthy  -> supervisor exits 0, all cleaned up
+#   +. TERM/INT/QUIT while both built-ins healthy -> exit 0, both cleaned up
 #
 # Usage: scripts/test-supervisor.sh [path-to-pinner-supervise.sh]
 
@@ -65,6 +67,19 @@ while :; do sleep 1; done
 EOF
 chmod +x "$WORK/bin/php-fpm" "$WORK/bin/caddy"
 
+# Stub optional supervised worker (enabled per scenario via USES_WORKER=1):
+# mirrors php-fpm (FAIL_WORKER -> immediate exit, else long-running).
+cat > "$WORK/bin/worker" <<'EOF'
+#!/bin/sh
+echo "$$" > "$worker_stub_pidfile"
+if [ -n "${FAIL_WORKER:-}" ]; then
+    exit "$FAIL_WORKER"
+fi
+trap 'exit 0' TERM INT QUIT
+while :; do sleep 1; done
+EOF
+chmod +x "$WORK/bin/worker"
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -82,17 +97,27 @@ assert_reaped() {
 }
 
 run_supervisor() {
-    # $1 = "healthy"|"fail-php"|"fail-caddy"
+    # $1 = "healthy"|"fail-php"|"fail-caddy"|"fail-worker". The optional
+    # supervised worker is enabled only when the harness exported USES_WORKER=1
+    # before calling (worker env is always pinned so no leak across scenarios).
     mode=$1
     (
         cd "$WORK"
-        unset FAIL_PHP FAIL_CADDY
+        unset FAIL_PHP FAIL_CADDY FAIL_WORKER
         case "$mode" in
-            fail-php)   FAIL_PHP=7   ;;
-            fail-caddy) FAIL_CADDY=9 ;;
+            fail-php)    FAIL_PHP=7    ;;
+            fail-caddy)  FAIL_CADDY=9  ;;
+            fail-worker) FAIL_WORKER=11 ;;
         esac
+        if [ "${USES_WORKER:-0}" = "1" ]; then
+            export PINNER_SUPERVISED_CMD="$WORK/bin/worker" \
+                   worker_stub_pidfile="$WORK/worker_stub.pid"
+            rm -f "$WORK/worker_stub.pid"
+        else
+            export PINNER_SUPERVISED_CMD=
+        fi
         # Import the stub env vars into the supervisor's spawned children.
-        export FAIL_PHP FAIL_CADDY php_stub_pidfile="$WORK/php_stub.pid" \
+        export FAIL_PHP FAIL_CADDY FAIL_WORKER php_stub_pidfile="$WORK/php_stub.pid" \
                caddy_stub_pidfile="$WORK/caddy_stub.pid" PATH="$WORK/bin:$PATH"
         rm -f "$WORK/php_stub.pid" "$WORK/caddy_stub.pid"
         # Invoke via `sh` so the harness runs even though the repo scripts are
@@ -135,6 +160,15 @@ assert_reaped "$WORK/php_stub.pid"   "php-fpm stub (survivor)"
 # traps run exactly as they do when the supervisor is PID 1 in the container.
 signal_shutdown() {
     sig=$1
+    # Worker-aware env + readiness probe: with USES_WORKER=1 the sender waits
+    # for all three children to register before signalling.
+    if [ "${USES_WORKER:-0}" = "1" ]; then
+        worker_env="export PINNER_SUPERVISED_CMD='$WORK/bin/worker' worker_stub_pidfile='$WORK/worker_stub.pid'; rm -f '$WORK/worker_stub.pid';"
+        waitall="[ ! -s '$WORK/php_stub.pid' ] || [ ! -s '$WORK/caddy_stub.pid' ] || [ ! -s '$WORK/worker_stub.pid' ]"
+    else
+        worker_env="export PINNER_SUPERVISED_CMD=;"
+        waitall="[ ! -s '$WORK/php_stub.pid' ] || [ ! -s '$WORK/caddy_stub.pid' ]"
+    fi
     helper="$WORK/signal_probe.sh"
     cat > "$helper" <<HELPER
 #!/bin/sh
@@ -142,13 +176,14 @@ set -u
 SUPERVISOR='$SUPERVISOR'
 WORK='$WORK'
 export php_stub_pidfile='$WORK/php_stub.pid' caddy_stub_pidfile='$WORK/caddy_stub.pid'
+$worker_env
 export PATH="$WORK/bin:$PATH"
 rm -f '$WORK/php_stub.pid' '$WORK/caddy_stub.pid'
-# Background sender: once both stub children register, deliver \$sig to \$\$
+# Background sender: once every stub child registers, deliver \$sig to \$\$
 # (== the helper PID, which is the supervisor PID after the exec below).
 (
     i=0
-    while [ ! -s '$WORK/php_stub.pid' ] || [ ! -s '$WORK/caddy_stub.pid' ]; do
+    while $waitall; do
         i=\$((i + 1)); [ "\$i" -le 200 ] || exit 1; sleep 0.05
     done
     sleep 0.5
@@ -172,5 +207,38 @@ for _sig in TERM INT QUIT; do
     assert_reaped "$WORK/php_stub.pid"   "php-fpm stub"
     assert_reaped "$WORK/caddy_stub.pid" "caddy stub"
 done
+
+# ---- optional supervised worker (PINNER_SUPERVISED_CMD) ---------------------
+
+# The worker (used by the WordPress image for its WP-CLI cron driver) must obey
+# exactly the same lifecycle guarantees as the built-in children.
+
+echo "== scenario 3: worker exits nonzero -> supervisor exits with its status =="
+USES_WORKER=1
+st=0
+run_supervisor fail-worker || st=$?
+[ "$st" -ne 0 ] || fail "supervisor exited 0 when worker crashed (expected nonzero)"
+[ "$st" -eq 11 ] || fail "supervisor exited $st, expected preserved worker status 11"
+pass "worker crash -> supervisor exit $st (nonzero, worker status preserved)"
+assert_reaped "$WORK/worker_stub.pid" "worker stub"
+assert_reaped "$WORK/php_stub.pid"   "php-fpm stub (survivor)"
+assert_reaped "$WORK/caddy_stub.pid" "caddy stub (survivor)"
+
+echo "== scenario 4: php crash with worker healthy -> worker reaped as survivor =="
+st=0
+run_supervisor fail-php || st=$?
+[ "$st" -ne 0 ] || fail "supervisor exited 0 when php-fpm crashed (expected nonzero)"
+[ "$st" -eq 7 ] || fail "supervisor exited $st, expected preserved child status 7"
+assert_reaped "$WORK/php_stub.pid"   "php-fpm stub"
+assert_reaped "$WORK/worker_stub.pid" "worker stub (survivor)"
+assert_reaped "$WORK/caddy_stub.pid" "caddy stub (survivor)"
+pass "php crash with worker healthy -> all children terminated and reaped"
+
+echo "== scenario 5: TERM while all three healthy -> clean shutdown, exit 0 =="
+signal_shutdown TERM || fail "TERM shutdown with worker failed"
+pass "TERM with worker -> supervisor exit 0 (clean docker stop)"
+assert_reaped "$WORK/php_stub.pid"    "php-fpm stub"
+assert_reaped "$WORK/caddy_stub.pid"  "caddy stub"
+assert_reaped "$WORK/worker_stub.pid" "worker stub"
 
 echo "== supervisor harness OK =="

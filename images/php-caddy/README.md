@@ -114,3 +114,25 @@ Set `ENV PINNER_INIT=/path/to/script` from a child Dockerfile. The hook runs as
 root before the auth validation and privilege drop; use it to seed persistent
 volumes and fix root-owned mounts. See `images/wordpress` for a concrete
 example.
+
+### Optional supervised worker: `PINNER_SUPERVISED_CMD`
+
+A child image can add **one** extra supervised long-running worker (alongside
+PHP-FPM and Caddy) by exporting `PINNER_SUPERVISED_CMD` — an `sh` command line
+evaluated in the worker's wrapper (point it at an absolute script path). The
+worker runs as `www-data` (the supervisor starts entirely after the privilege
+drop) with exactly the same lifecycle guarantees as the built-in children:
+
+- **Fail-fast first-exit semantics** — if ANY supervised process (worker
+  included) dies, the supervisor terminates every survivor and exits with the
+  dead child's status, so the orchestrator restarts the whole container.
+  A worker that must survive transient conditions (e.g. WordPress install
+  deferral) therefore needs its own internal retry, like the WP cron worker.
+- **Signal handling** — `TERM`/`INT`/`QUIT` are forwarded to the worker for a
+  graceful `docker stop`.
+- **Opt-in** — unset, the supervisor behaves exactly as before (two children),
+  so images without a worker are unaffected.
+
+The WordPress image uses this for its WP-CLI cron driver
+(`pinner-wp-cron.sh`, see `images/wordpress/README.md`). Regression scenarios
+for the worker live in `scripts/test-supervisor.sh`.

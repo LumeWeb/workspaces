@@ -150,6 +150,16 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $_SERVER['HTTP_X
 if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
     $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
 }
+// Workspace lockdown: wp-admin must never be able to edit the filesystem or
+// pull updates (code is image-provisioned, wp-content mounts are user data);
+// out of band, WP keeps its own schedule and merely finds nothing to update.
+define( 'DISALLOW_FILE_EDIT', true );
+define( 'DISALLOW_FILE_MODS', true );
+define( 'AUTOMATIC_UPDATER_DISABLED', true );
+define( 'WP_AUTO_UPDATE_CORE', false );
+// WP cron must not fire from web traffic: a supervised worker drives it via
+// WP-CLI every tick instead (see pinner-wp-cron.sh).
+define( 'DISABLE_WP_CRON', true );
 PROXYEOF
         if [ -n "${COOLIFY_URL:-}" ]; then
             printf 'define( %s, %s );\n' "'WP_HOME'" "$url_export"

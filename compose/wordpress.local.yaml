@@ -78,6 +78,9 @@ services:
       # Overridable so verify-wordpress.sh can test credential rotation on a
       # later boot (compose interpolation from the caller's environment).
       WORKSPACE_AUTH_PASSWORD: ${VERIFY_WP_PASS:-localpass}
+      # Short tick so verify-wordpress.sh can prove the supervised WP-CLI cron
+      # worker actually runs due events without slowing the suite down.
+      WP_CRON_INTERVAL: "5"
     ports:
       - "${HOST_PORT:-8080}:8080"
     volumes:

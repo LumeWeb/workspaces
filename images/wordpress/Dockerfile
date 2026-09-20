@@ -95,8 +95,15 @@ COPY --from=workspace-init-builder /out/workspace-init /usr/local/bin/workspace-
 # base drop to www-data and start Caddy + PHP-FPM.
 COPY wp-init.sh /usr/local/bin/pinner-wp-init
 
-RUN chmod +x /usr/local/bin/pinner-wp-init /usr/local/bin/workspace-init
+# -- WP-CLI cron worker --------------------------------------------------------
+# Supervised background cron driver (see pinner-wp-cron.sh). Passed to the base
+# supervisor via PINNER_SUPERVISED_CMD and run as www-data after the privilege
+# drop; replaces WP's web-triggered cron (which wp-config.php disables).
+COPY pinner-wp-cron.sh /usr/local/bin/pinner-wp-cron
+
+RUN chmod +x /usr/local/bin/pinner-wp-init /usr/local/bin/pinner-wp-cron /usr/local/bin/workspace-init
 ENV PINNER_INIT=/usr/local/bin/pinner-wp-init
+ENV PINNER_SUPERVISED_CMD=/usr/local/bin/pinner-wp-cron
 
 LABEL org.opencontainers.image.title="workspace-wordpress" \
       org.opencontainers.image.description="Pinner WordPress on Caddy + PHP-FPM" \

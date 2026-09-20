@@ -105,7 +105,32 @@ than a custom generator:
   coming up; salts are generated fresh by WP-CLI. `WP_CACHE_KEY_SALT` is
   intentionally *not* set (the whole config is ephemeral, no persistent object
   cache).
+- **Workspace lockdown** (baked in as hard `define()`s via `--extra-php`):
+  - `DISALLOW_FILE_EDIT` / `DISALLOW_FILE_MODS` — wp-admin can never edit the
+    filesystem or install/modify code (the image provisions WordPress; code is
+    never user-writable through the web UI).
+  - `AUTOMATIC_UPDATER_DISABLED` / `WP_AUTO_UPDATE_CORE` — WordPress never
+    updates itself out of band (its scheduled update hooks become no-ops that
+    find nothing to do; outbound checks to api.wordpress.org remain harmless
+    reads).
+  - `DISABLE_WP_CRON` — cron is not triggered by web traffic; the supervised
+    worker below ticks it instead.
 - Config is **ephemeral**: regenerated every start.
+
+### Background cron (`pinner-wp-cron.sh`, supervised WP-CLI worker)
+
+With web cron disabled, the scheduler is driven by a third supervised child
+(passed to the base supervisor via `ENV PINNER_SUPERVISED_CMD`):
+
+- Every `WP_CRON_INTERVAL` (seconds, default **30**) it runs
+  `wp --path=/var/www/html cron event run --due-now` — WP's own scheduler
+  decides what is due; there is **no DIY system cron, no crontab, no schedule
+  duplicated outside WordPress**.
+- Transient conditions (DB still coming up, install deferred to a later boot)
+  are warned on stderr and retried on the next tick — never fatal, so the
+  worker cannot take an otherwise-healthy container down.
+- Being a supervised child, an actual worker death fails the container
+  (orchestrator restarts it), and `TERM`/`INT`/`QUIT` shut it down gracefully.
 
 ### Automatic bootstrap (`wp core install` + password converge)
 
