@@ -185,8 +185,9 @@ user content), so delivery is image-owned:
   image redeploy rather than instantly.
 - A **Cast guard MU plugin** (`mu-plugins/cast-guard.php`, copied into the
   ephemeral `wp-content/mu-plugins` every boot) re-adds `cast/cast.php` to the
-  active plugins on every read and removes the admin Deactivate action — the
-  plugin cannot be turned off. Startup convergence (`wp plugin activate cast`)
+  active plugins on every read (only while the plugin's files exist, so a
+  volume seeded before Cast never gets a phantom active entry) and removes the
+  admin Deactivate action — the plugin cannot be turned off. Startup convergence (`wp plugin activate cast`)
   only performs the real one-time activation transition (schema install,
   rewrite flush).
 

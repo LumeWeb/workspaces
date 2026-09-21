@@ -34,6 +34,18 @@ if (!function_exists('wp_salt') && defined('ABSPATH') && defined('WPINC')) {
 }
 
 /*
+ * Force-on only applies while the managed plugin files actually exist. Workspaces
+ * whose plugins volume was seeded before Cast shipped (one-time volume seeding
+ * never copies onto an initialized volume) must NOT get a phantom
+ * active-plugins entry churned in by this filter while its directory is absent;
+ * they pick Cast up on the next image redeploy, when the baked version merges
+ * into the volume.
+ */
+$cast_files_present = static function (): bool {
+    return file_exists(constant('WP_PLUGIN_DIR') . '/' . CAST_MAIN);
+};
+
+/*
  * Re-add Cast on EVERY read of the active_plugins option, regardless of how it
  * was last written (admin Deactivate, WP-CLI, REST). A read-time filter means
  * Cast is "active" again before the next request boots, so no separate boot run
@@ -47,10 +59,12 @@ if (!function_exists('wp_salt') && defined('ABSPATH') && defined('WPINC')) {
  */
 add_filter(
     'option_active_plugins',
-    static function (array $plugins): array {
-        return in_array(CAST_MAIN, $plugins, true)
-            ? $plugins
-            : array_merge($plugins, [CAST_MAIN]);
+    static function (array $plugins) use ($cast_files_present): array {
+        if (in_array(CAST_MAIN, $plugins, true) || !$cast_files_present()) {
+            return $plugins;
+        }
+
+        return array_merge($plugins, [CAST_MAIN]);
     }
 );
 
@@ -58,12 +72,13 @@ add_filter(
  * Network-active list force-on. This only ever fires in multisite contexts
  * (single-site workspaces never read active_sitewide_plugins), where Cast must
  * be enabled network-wide to be active. Cast registers no network-specific
- * lifecycle today, so a plain entry is sufficient.
+ * lifecycle today, so a plain entry is sufficient. Same existence gate as the
+ * regular active-plugins filter above.
  */
 add_filter(
     'site_option_active_sitewide_plugins',
-    static function (array $sitewide): array {
-        if (!array_key_exists(CAST_MAIN, $sitewide)) {
+    static function (array $sitewide) use ($cast_files_present): array {
+        if (!array_key_exists(CAST_MAIN, $sitewide) && $cast_files_present()) {
             $sitewide[CAST_MAIN] = true;
         }
 

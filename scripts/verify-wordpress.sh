@@ -232,6 +232,22 @@ docker exec "$(wp_container)" sh -c 'test ! -e /var/www/html/wp-content/plugins/
     && pass "deleted bundled plugin was not resurrected" \
     || die "deleted plugin came back (seeding should be one-time)"
 
+echo "== [verify] cast guard is neutral while cast files are missing (old volumes) =="
+# Simulate a plugins volume seeded before Cast shipped: remove the plugin dir
+# (the never-clobber contract keeps it absent across recreations). The MU
+# guard must NOT force a phantom active-plugins entry in that state — those
+# volumes pick Cast up on their next image redeploy (baked version merge).
+docker exec "$(wp_container)" sh -c 'rm -rf /var/www/html/wp-content/plugins/cast'
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+docker exec "$(wp_container)" sh -c 'test ! -d /var/www/html/wp-content/plugins/cast' \
+    && pass "cast stays absent on a pre-cast volume (one-time seeding)" \
+    || die "cast resurrected despite one-time seeding"
+if wp plugin is-active cast --allow-root; then
+    die "cast guard forced a phantom active-plugins entry while cast files are missing"
+fi
+pass "cast guard neutral while cast files are missing"
+
 echo "== [verify] per-boot admin password rotation =="
 # Bump WORKSPACE_AUTH_PASSWORD (via compose interpolation) and recreate: the
 # image must converge the WordPress admin password on the next boot. The new
