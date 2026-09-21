@@ -11,13 +11,16 @@ set -euo pipefail
 #      is a real misconfiguration; refuse to boot rather than run broken).
 #   3. Seed persistent themes/plugins volumes from the immutable source,
 #      despite the fact that the mounts shadow the same paths in the image.
-#   4. Leave uploads unseeded (user media only).
-#   5. Generate an ephemeral wp-config.php with WP-CLI `wp config create`
+#   4. Copy the image-owned mu-plugins (Cast guard) into the ephemeral
+#      wp-content/mu-plugins on EVERY boot (it is not a persistent mount).
+#   5. Leave uploads unseeded (user media only).
+#   6. Generate an ephemeral wp-config.php with WP-CLI `wp config create`
 #      (mode 0600, owned by www-data).
-#   6. Wait (bounded) for the DB to come up, then on first boot run
+#   7. Wait (bounded) for the DB to come up, then on first boot run
 #      `wp core install` and on every boot converge the admin password to the
-#      current WORKSPACE_AUTH_PASSWORD (credential rotation).
-#   7. Fix ownership so www-data can write.
+#      current WORKSPACE_AUTH_PASSWORD (credential rotation), and converge the
+#      platform-managed Cast plugin to active (real activation hooks).
+#   8. Fix ownership so www-data can write.
 #
 # This whole block must run as root: Docker/Coolify named volumes can be mounted
 # root:root, and a fresh mount shadows the image content at /var/www/html/wp-content/*.
@@ -150,11 +153,13 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $_SERVER['HTTP_X
 if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
     $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
 }
-// Workspace lockdown: wp-admin must never be able to edit the filesystem or
-// pull updates (code is image-provisioned, wp-content mounts are user data);
-// out of band, WP keeps its own schedule and merely finds nothing to update.
+// Workspace lockdown: wp-admin can never EDIT the filesystem (plugin/theme
+// editor is dead), but installing and updating plugins through wp-admin stays
+// available on purpose (no DISALLOW_FILE_MODS) — that is how the site manages
+// its own plugin set alongside the image-provisioned ones. Automatic
+// (out-of-band) WordPress/plugin updates remain off: installs and updates only
+// ever happen when someone triggers them.
 define( 'DISALLOW_FILE_EDIT', true );
-define( 'DISALLOW_FILE_MODS', true );
 define( 'AUTOMATIC_UPDATER_DISABLED', true );
 define( 'WP_AUTO_UPDATE_CORE', false );
 // WP cron must not fire from web traffic: a supervised worker drives it via
@@ -260,6 +265,24 @@ converge_admin_password() {
     fi
 }
 
+# Converge the platform-managed Cast plugin to active on every boot (after the
+# site is installed and WP-CLI can talk to the DB). This performs the REAL
+# activation transition (CastActivator: schema install, rewrite flush) whenever
+# the plugin was never activated; the baked-in cast-guard MU plugin then keeps
+# it active read-side forever, so this is convergence, not enforcement.
+activate_cast() {
+    if ! run_wp core is-installed >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! run_wp plugin is-installed cast >/dev/null 2>&1; then
+        echo "WARN: cast plugin files are missing from the plugins volume; cannot activate." >&2
+        return 0
+    fi
+    if ! run_wp plugin activate cast >/dev/null 2>&1; then
+        echo "WARN: could not activate the cast plugin (it stays guarded by the MU layer)." >&2
+    fi
+}
+
 # One-time seed of a persistent mounted directory (themes or plugins) from the
 # immutable image source. Copy-based, never symlinked, so the volume becomes
 # authoritative and stays writable/upgradable by WordPress.
@@ -314,6 +337,19 @@ seed_dir() {
     exec 9>&-
 }
 
+# Copy the image-owned mu-plugins into the ephemeral wp-content. mu-plugins is
+# deliberately NOT a persistent mount (it is platform-owned code, like core),
+# so this runs on every boot: an image update always replaces the guard on the
+# next container start, and there is no user content here to ever preserve.
+seed_mu_plugins() {
+    local src="$SRC/wp-content/mu-plugins"
+    local dst="$WP_CONTENT/mu-plugins"
+
+    mkdir -p "$dst"
+    cp -a "$src"/. "$dst"/
+    chown -R "$APP_USER:$APP_USER" "$dst"
+}
+
 # uploads is never seeded; it only needs an existing, app-owned, writable dir.
 prepare_uploads() {
     local dst="$WP_CONTENT/uploads"
@@ -340,6 +376,7 @@ main() {
     require_db_env
     seed_dir themes
     seed_dir plugins
+    seed_mu_plugins
     prepare_uploads
     fix_wp_content_ownership
     generate_wp_config
@@ -347,8 +384,10 @@ main() {
     if wait_for_db; then
         if run_wp core is-installed >/dev/null 2>&1; then
             converge_admin_password
+            activate_cast
         else
             auto_install
+            activate_cast
         fi
     else
         echo "WARN: DB not reachable within ${WP_DB_WAIT_TRIES}s; skipping WordPress install this boot (will retry on next boot)." >&2

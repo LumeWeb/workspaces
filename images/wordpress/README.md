@@ -8,6 +8,7 @@ built on the `php-caddy` base. Uses official WordPress conventions.
 | Base | `php-caddy` (`php:8.5.10-fpm-bookworm` + Caddy `2.11.4`) |
 | WordPress | `7.1` (archive sha256 verified) |
 | WP-CLI | `2.12.0` (baked in, sha512 verified) |
+| Cast plugin | latest `develop` tree snapshot, deps vendored at build (not checksum-pinned yet) |
 | Immutable source | `/usr/src/wordpress` |
 | Runtime docroot | `/var/www/html` (ephemeral) |
 | Listen | `0.0.0.0:${PORT:-8080}` |
@@ -68,20 +69,24 @@ Runs as root (via the base `PINNER_INIT` hook) before privileges are dropped:
    exits non-zero (a WordPress workspace without a DB is a real
    misconfiguration; we refuse to boot broken).
 3. **Seed `themes` and `plugins`** from `/usr/src/wordpress/wp-content` onto the
-   mounted volumes (copy-based, never symlinks), so the default theme and
-   bundled plugins appear on a brand-new shadowing volume.
-4. **Leave `uploads` unseeded** (user media only).
-5. **Generate `wp-config.php`** with WP-CLI `wp config create` as `www-data`
+   mounted volumes (copy-based, never symlinks), so the default theme, bundled
+   plugins, and the platform-managed **cast** plugin appear on a brand-new
+   shadowing volume.
+4. **Copy `mu-plugins`** (the Cast guard) into the ephemeral `wp-content` on
+   every boot — it is platform-owned code like core, not persistent content.
+5. **Leave `uploads` unseeded** (user media only).
+6. **Generate `wp-config.php`** with WP-CLI `wp config create` as `www-data`
    (mode **0600**, owner-only read; DB password + proxy/URL extra PHP travel on
    stdin, never argv).
-6. **Automatic bootstrap** — wait (bounded) for the DB, then on first boot run
+7. **Automatic bootstrap** — wait (bounded) for the DB, then on first boot run
    `wp core install --url=$COOLIFY_URL` with the owner email (fetched from the
    portal by the baked-in `workspace-init` CLI) and the existing
    `WORKSPACE_AUTH_*` credentials; on every boot converge the admin password to
-   the current `WORKSPACE_AUTH_PASSWORD`. A DB that is merely down, or a portal
-   that cannot supply the email, defers install to a later boot with a clear
-   warning rather than inventing a bogus admin email.
-7. **Ownership** — repair root-owned mount roots; only recursive-chown when the
+   the current `WORKSPACE_AUTH_PASSWORD` and converge the platform-managed
+   **cast** plugin to active (real activation hooks). A DB that is merely down,
+   or a portal that cannot supply the email, defers install to a later boot
+   with a clear warning rather than inventing a bogus admin email.
+8. **Ownership** — repair root-owned mount roots; only recursive-chown when the
    mount root is not already owned by `www-data`.
 
 ### `wp-config.php` generation (`wp config create`)
@@ -106,13 +111,16 @@ than a custom generator:
   intentionally *not* set (the whole config is ephemeral, no persistent object
   cache).
 - **Workspace lockdown** (baked in as hard `define()`s via `--extra-php`):
-  - `DISALLOW_FILE_EDIT` / `DISALLOW_FILE_MODS` — wp-admin can never edit the
-    filesystem or install/modify code (the image provisions WordPress; code is
-    never user-writable through the web UI).
+  - `DISALLOW_FILE_EDIT` — wp-admin can never edit the filesystem (plugin/theme
+    editor is dead). Pieces of code that ARE managed (core, the `cast` plugin)
+    come from the image; everything in `wp-content` stays out of the editor.
+  - No `DISALLOW_FILE_MODS` — **installing and updating plugins through
+    wp-admin stays available on purpose**; that is how the site manages its own
+    plugin set alongside the image-provisioned ones (Cast).
   - `AUTOMATIC_UPDATER_DISABLED` / `WP_AUTO_UPDATE_CORE` — WordPress never
     updates itself out of band (its scheduled update hooks become no-ops that
     find nothing to do; outbound checks to api.wordpress.org remain harmless
-    reads).
+    reads). Updates happen only when someone triggers them.
   - `DISABLE_WP_CRON` — cron is not triggered by web traffic; the supervised
     worker below ticks it instead.
 - Config is **ephemeral**: regenerated every start.
@@ -160,6 +168,27 @@ With web cron disabled, the scheduler is driven by a third supervised child
 Initialization is serialized with `flock` on the shared volume and idempotent:
 a bounced container or concurrent first boot will not re-seed, and user edits
 to plugins/themes survive recreation.
+
+## Platform-managed Cast plugin
+
+The **Cast** plugin is workspace infrastructure (like `wp-config.php` — not
+user content), so delivery is image-owned:
+
+- The image **bakes the latest `develop` tree snapshot** of
+  [`LumeWeb/cast`](https://github.com/LumeWeb/cast) (GitHub codeload tarball;
+  deliberately not checksum-pinned yet) with runtime Composer dependencies
+  vendored at build time, under `/usr/src/wordpress/wp-content/plugins/cast`.
+- One-time volume seeding delivers it like any bundled plugin. **Already-seeded
+  volumes are not touched** (the never-clobber user-content contract) —
+  reconciling an existing volume with the baked version is a planned
+  boot-convergence step, so *existing* workspaces pick Cast up on their next
+  image redeploy rather than instantly.
+- A **Cast guard MU plugin** (`mu-plugins/cast-guard.php`, copied into the
+  ephemeral `wp-content/mu-plugins` every boot) re-adds `cast/cast.php` to the
+  active plugins on every read and removes the admin Deactivate action — the
+  plugin cannot be turned off. Startup convergence (`wp plugin activate cast`)
+  only performs the real one-time activation transition (schema install,
+  rewrite flush).
 
 ## Environment
 

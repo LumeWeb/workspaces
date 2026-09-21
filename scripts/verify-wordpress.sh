@@ -87,11 +87,12 @@ admin_email="$(wp user get "$AUTH_USER" --field=user_email --allow-root)"
     && pass "admin '$AUTH_USER' registered with portal owner email ($admin_email)" \
     || die "admin email = '$admin_email', expected '$OWNER_EMAIL'"
 
-echo "== [verify] workspace lockdown (no FS edits, no updates, no web cron) =="
+echo "== [verify] workspace lockdown (no FS edits, install/update allowed, no web cron) =="
 # wp-init.sh bakes these constants into the generated wp-config.php; assert
 # they are LIVE in the generated config (a mere Dockerfile string would pass
-# an image-content grep but not protect the site).
-for c in DISALLOW_FILE_EDIT DISALLOW_FILE_MODS AUTOMATIC_UPDATER_DISABLED DISABLE_WP_CRON; do
+# an image-content grep but not protect the site). Plugin/theme editing stays
+# impossible, but wp-admin plugin install/update must work (no DISALLOW_FILE_MODS).
+for c in DISALLOW_FILE_EDIT AUTOMATIC_UPDATER_DISABLED DISABLE_WP_CRON; do
     val="$(wp config get "$c" --type=constant --allow-root)"
     [ "$val" = "1" ] || die "$c is not enabled in the generated wp-config.php (got: '$val')"
 done
@@ -101,7 +102,12 @@ upd="$(wp config get WP_AUTO_UPDATE_CORE --type=constant --allow-root)"
 case "$upd" in
     1|true|minor|major|beta) die "WP_AUTO_UPDATE_CORE enables core updates (got: '$upd')" ;;
 esac
-pass "DISALLOW_FILE_EDIT/MODS, AUTOMATIC_UPDATER_DISABLED, WP_AUTO_UPDATE_CORE, DISABLE_WP_CRON all active"
+# DISALLOW_FILE_MODS must be GONE ENTIRELY (the old image baked it): any
+# definition, even 0, keeps WP's update/install machinery disabled.
+if mods="$(wp config get DISALLOW_FILE_MODS --type=constant --allow-root 2>/dev/null)" && [ -n "$mods" ]; then
+    die "DISALLOW_FILE_MODS is still defined (got: '$mods'); wp-admin plugin installs/updates would be blocked"
+fi
+pass "DISALLOW_FILE_EDIT, AUTOMATIC_UPDATER_DISABLED, WP_AUTO_UPDATE_CORE, DISABLE_WP_CRON active; DISALLOW_FILE_MODS absent"
 
 echo "== [verify] supervised WP-CLI cron worker =="
 # The worker is a third supervised child (PINNER_SUPERVISED_CMD) driving WP's
@@ -156,6 +162,18 @@ plugins="$(docker exec "$(wp_container)" sh -c 'ls /var/www/html/wp-content/plug
 echo "$plugins" | grep -q akismet || die "bundled plugin akismet missing: $plugins"
 pass "bundled plugin akismet present"
 
+# The platform-managed Cast plugin must be seeded with the volume and active.
+echo "$plugins" | grep -qx cast || die "platform-managed cast plugin missing: $plugins"
+pass "platform-managed cast plugin present on fresh volume"
+
+docker exec "$(wp_container)" sh -c 'test -f /var/www/html/wp-content/mu-plugins/cast-guard.php' \
+    && pass "cast-guard MU plugin present" \
+    || die "cast-guard MU plugin missing (force-on enforcement is dead)"
+
+wp plugin is-active cast --allow-root \
+    || die "cast plugin is not active on a fresh volume (cast guard / activate_cast failed)"
+pass "cast plugin active on fresh volume"
+
 wp theme activate twentytwentyfive --allow-root >/dev/null
 pass "default theme activated"
 
@@ -197,6 +215,14 @@ pass "user upload survived and was not overwritten"
 docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/themes/twentytwentyfive' \
     && pass "default theme still present after recreation" \
     || die "default theme missing after recreation"
+
+echo "== [verify] cast survives recreation and stays (force-)active =="
+docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/plugins/cast' \
+    && pass "cast plugin survived recreation" \
+    || die "cast plugin missing after recreation"
+wp plugin is-active cast --allow-root \
+    || die "cast plugin not active after recreation"
+pass "cast plugin active after recreation"
 
 echo "== [verify] deleted plugin is not resurrected (marker honoured) =="
 docker exec "$(wp_container)" sh -c 'rm /var/www/html/wp-content/plugins/hello.php'

@@ -24,7 +24,8 @@ export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
        CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
        WORDPRESS_VERSION WORDPRESS_SHA256 \
        WP_CLI_VERSION WP_CLI_SHA512 \
-       GO_BASE GO_BASE_DIGEST
+       GO_BASE GO_BASE_DIGEST \
+       COMPOSER_BASE COMPOSER_BASE_DIGEST
 
 echo "== [deps] checking Caddy checksums ($CADDY_VERSION) =="
 curl -fsSL -o /tmp/caddy-checksums.txt \
@@ -74,6 +75,11 @@ echo "  ok  WP-CLI ${WP_CLI_VERSION} sha512 matches upstream"
 echo "== [deps] Go builder image pin (${GO_BASE}) =="
 echo "  GO_BASE_DIGEST is verified by the Docker build (FROM ...@digest); pin: $GO_BASE_DIGEST"
 
+echo "== [deps] Composer builder image pin (${COMPOSER_BASE}) =="
+# The Cast snapshot itself is intentionally NOT checksum-pinned yet (latest
+# develop tree); only its Composer builder base is pinned here.
+echo "  COMPOSER_BASE_DIGEST is verified by the Docker build (FROM ...@digest); pin: $COMPOSER_BASE_DIGEST"
+
 # Drift guard: versions.env is the single source of truth, but the Docker build
 # only sees what docker-bake.hcl injects. Verify the resolved bake plan passes
 # exactly the versions.env values as build ARGs (and the OCI labels that mirror
@@ -112,6 +118,8 @@ if command -v docker >/dev/null 2>&1; then
         check_bake wordpress "WP-CLI sha512"    WP_CLI_SHA512      "$WP_CLI_SHA512"
         check_bake wordpress "Go base"          GO_BASE            "$GO_BASE"
         check_bake wordpress "Go base digest"   GO_BASE_DIGEST     "$GO_BASE_DIGEST"
+        check_bake wordpress "Composer base"        COMPOSER_BASE        "$COMPOSER_BASE"
+        check_bake wordpress "Composer base digest" COMPOSER_BASE_DIGEST "$COMPOSER_BASE_DIGEST"
 
         # Runtime labels must mirror the same single source (they are fed from
         # the same bake variables, so this is cross-checking the mechanism).

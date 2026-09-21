@@ -28,6 +28,11 @@ first image is `wordpress` (WordPress served by Caddy on PHP-FPM).
   bypass it via Caddy's `remote_ip` (real peer, never spoofable forwarding
   headers). Missing/invalid `WORKSPACE_AUTH_*` fails the container closed. Do
   not weaken this to trust forwarding headers or to add an auth-disabled mode.
+- The **Cast** plugin is platform-managed: baked from the latest GitHub
+  `develop` tree snapshot (Composer deps vendored at build; not checksum-pinned
+  yet) and force-kept active by an image-owned MU plugin. Plugin/theme editing
+  is disabled (`DISALLOW_FILE_EDIT`) but wp-admin plugin install/update must
+  stay available — never reintroduce `DISALLOW_FILE_MODS`.
 - Database settings come from `WORDPRESS_DB_HOST/PORT/NAME/USER/PASSWORD`.
 - `COOLIFY_URL` supplies the externally reachable public URL used for
   `WP_HOME`/`WP_SITEURL` and for `wp core install`; `X-Forwarded-*` from the
