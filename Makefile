@@ -39,7 +39,8 @@ export PHP_BASE PHP_BASE_DIGEST CADDY_VERSION \
        CADDY_SHA512_AMD64 CADDY_SHA512_ARM64 \
        WORDPRESS_VERSION WORDPRESS_SHA256 \
        WP_CLI_VERSION WP_CLI_SHA512 \
-       GO_BASE GO_BASE_DIGEST
+       GO_BASE GO_BASE_DIGEST \
+       COMPOSER_BASE COMPOSER_BASE_DIGEST
 
 .PHONY: help build build-php-caddy build-wordpress \
         lint shellcheck hadolint \

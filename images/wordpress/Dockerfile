@@ -12,7 +12,22 @@
 ## --------------------------------------------------------------------------
 ARG GO_BASE=workspace-init-builder-unset
 ARG GO_BASE_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
+ARG COMPOSER_BASE=cast-builder-unset
+ARG COMPOSER_BASE_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
 FROM ${GO_BASE}@${GO_BASE_DIGEST} AS workspace-init-builder
+
+## --------------------------------------------------------------------------
+## cast plugin builder stage
+##
+## Vendors the platform-managed Cast plugin from the latest `develop` tree
+## snapshot on GitHub (deliberately NOT checksum-pinned yet; evolves later into
+## a versioned, verified release artifact). The GitHub tree carries no vendor/
+## directory (it is gitignored), so Composer installs the runtime dependencies
+## here new on every build — deterministic through the snapshot's composer.lock.
+## The dependency set includes an SSH-style git VCS URL, transparently rewritten
+## to HTTPS so a CI build without SSH keys can fetch it. The ARGs are declared
+## globally (before the first FROM) so this FROM resolves.
+## --------------------------------------------------------------------------
 WORKDIR /src
 # Copy manifests first so `go mod download` is cached independently of source
 # edits, then build with CGO disabled for a self-contained static binary that
@@ -21,6 +36,27 @@ COPY workspace-init/go.mod workspace-init/go.sum ./
 RUN go mod download
 COPY workspace-init/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/workspace-init .
+
+## --------------------------------------------------------------------------
+## cast plugin builder stage
+##
+## Vendors the platform-managed Cast plugin from the latest `develop` tree
+## snapshot on GitHub (deliberately NOT checksum-pinned yet; evolves later into
+## a versioned, verified release artifact). The GitHub tree carries no vendor/
+## directory (it is gitignored), so Composer installs the runtime dependencies
+## here new on every build — deterministic through the snapshot's composer.lock.
+## The dependency set includes an SSH-style git VCS URL, transparently rewritten
+## to HTTPS so a CI build without SSH keys can fetch it.
+## --------------------------------------------------------------------------
+FROM ${COMPOSER_BASE}@${COMPOSER_BASE_DIGEST} AS cast-builder
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:"; \
+    curl -fsSL -o /tmp/cast.tar.gz \
+        "https://codeload.github.com/LumeWeb/cast/tar.gz/refs/heads/develop"; \
+    mkdir -p /out/cast; \
+    tar -xzf /tmp/cast.tar.gz --strip-components=1 -C /out/cast; \
+    rm -f /tmp/cast.tar.gz
+WORKDIR /out/cast
+RUN composer install --no-dev --prefer-dist --no-interaction --no-progress --no-scripts
 
 ## --------------------------------------------------------------------------
 ## Pinner WordPress image: WordPress served by Caddy on PHP-FPM.
@@ -86,6 +122,19 @@ RUN set -eux; \
 
 # The workspace-init CLI (owner-email helper) from the builder stage above.
 COPY --from=workspace-init-builder /out/workspace-init /usr/local/bin/workspace-init
+
+# -- Platform-managed Cast plugin (immutable seed) ----------------------------
+# Baked into the immutable source tree, so wp-init.sh's one-time plugin seeding
+# delivers it to fresh plugins volumes like any bundled plugin. Already-seeded
+# volumes are NOT overwritten here (user-content preservation); reconciling an
+# existing volume with the baked version is a future wp-init step.
+COPY --from=cast-builder /out/cast /usr/src/wordpress/wp-content/plugins/cast
+
+# -- Cast guard MU plugin (force-on enforcement) ------------------------------
+# mu-plugins is always ephemeral (not a persistent mount), so wp-init.sh copies
+# this into wp-content/mu-plugins on every boot; the file enforces that Cast
+# stays active regardless of what wp-admin does with active_plugins.
+COPY mu-plugins/cast-guard.php /usr/src/wordpress/wp-content/mu-plugins/cast-guard.php
 
 # -- startup init hook --------------------------------------------------------
 # Runs as root before the base drops privileges: copies core into the ephemeral

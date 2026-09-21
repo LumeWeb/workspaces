@@ -11,13 +11,18 @@ set -euo pipefail
 #      is a real misconfiguration; refuse to boot rather than run broken).
 #   3. Seed persistent themes/plugins volumes from the immutable source,
 #      despite the fact that the mounts shadow the same paths in the image.
-#   4. Leave uploads unseeded (user media only).
-#   5. Generate an ephemeral wp-config.php with WP-CLI `wp config create`
+#   3b. Converge the image-managed Cast plugin into the persistent plugins
+#      volume (install/upgrade/rollback) on EVERY boot.
+#   4. Copy the image-owned mu-plugins (Cast guard) into the ephemeral
+#      wp-content/mu-plugins on EVERY boot (it is not a persistent mount).
+#   5. Leave uploads unseeded (user media only).
+#   6. Generate an ephemeral wp-config.php with WP-CLI `wp config create`
 #      (mode 0600, owned by www-data).
-#   6. Wait (bounded) for the DB to come up, then on first boot run
+#   7. Wait (bounded) for the DB to come up, then on first boot run
 #      `wp core install` and on every boot converge the admin password to the
-#      current WORKSPACE_AUTH_PASSWORD (credential rotation).
-#   7. Fix ownership so www-data can write.
+#      current WORKSPACE_AUTH_PASSWORD (credential rotation), and converge the
+#      platform-managed Cast plugin to active (real activation hooks).
+#   8. Fix ownership so www-data can write.
 #
 # This whole block must run as root: Docker/Coolify named volumes can be mounted
 # root:root, and a fresh mount shadows the image content at /var/www/html/wp-content/*.
@@ -150,11 +155,13 @@ if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $_SERVER['HTTP_X
 if ( isset( $_SERVER['HTTP_X_FORWARDED_HOST'] ) ) {
     $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
 }
-// Workspace lockdown: wp-admin must never be able to edit the filesystem or
-// pull updates (code is image-provisioned, wp-content mounts are user data);
-// out of band, WP keeps its own schedule and merely finds nothing to update.
+// Workspace lockdown: wp-admin can never EDIT the filesystem (plugin/theme
+// editor is dead), but installing and updating plugins through wp-admin stays
+// available on purpose (no DISALLOW_FILE_MODS) — that is how the site manages
+// its own plugin set alongside the image-provisioned ones. Automatic
+// (out-of-band) WordPress/plugin updates remain off: installs and updates only
+// ever happen when someone triggers them.
 define( 'DISALLOW_FILE_EDIT', true );
-define( 'DISALLOW_FILE_MODS', true );
 define( 'AUTOMATIC_UPDATER_DISABLED', true );
 define( 'WP_AUTO_UPDATE_CORE', false );
 // WP cron must not fire from web traffic: a supervised worker drives it via
@@ -260,6 +267,24 @@ converge_admin_password() {
     fi
 }
 
+# Converge the platform-managed Cast plugin to active on every boot (after the
+# site is installed and WP-CLI can talk to the DB). This performs the REAL
+# activation transition (CastActivator: schema install, rewrite flush) whenever
+# the plugin was never activated; the baked-in cast-guard MU plugin then keeps
+# it active read-side forever, so this is convergence, not enforcement.
+activate_cast() {
+    if ! run_wp core is-installed >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! run_wp plugin is-installed cast >/dev/null 2>&1; then
+        echo "WARN: cast plugin files are missing from the plugins volume; cannot activate." >&2
+        return 0
+    fi
+    if ! run_wp plugin activate cast >/dev/null 2>&1; then
+        echo "WARN: could not activate the cast plugin (it stays guarded by the MU layer)." >&2
+    fi
+}
+
 # One-time seed of a persistent mounted directory (themes or plugins) from the
 # immutable image source. Copy-based, never symlinked, so the volume becomes
 # authoritative and stays writable/upgradable by WordPress.
@@ -314,6 +339,76 @@ seed_dir() {
     exec 9>&-
 }
 
+# Print "yes" when two directory trees contain byte-identical files (same
+# relative paths, same contents), "no" otherwise. Content-based on purpose: it
+# lets every boot skip an unnecessary replacement without trusting mtimes
+# (cp -a preserves them, but wp-admin plugin edits do not keep them honest).
+same_dir() {
+    local l r
+    l="$(cd "$1" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)"
+    r="$(cd "$2" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)"
+    [ "$l" = "$r" ] && echo yes || echo no
+}
+
+# Converge the image-managed Cast plugin into the plugins volume. Cast is
+# platform-managed like core: the volume's plugins/cast directory (absent,
+# older baked copy, or user-drifted) is reconciled to the copy baked into the
+# image on EVERY boot, so image upgrade and rollback both converge existing
+# workspaces. This is delivery, not activation: activate_cast() below owns the
+# real activation hooks. All other plugins (and wp-admin updates to them) stay
+# under the volume's authority — only cast/ is ever touched here.
+#
+# The replaced copy is archived as plugins/.cast.bak-<epoch> (dot-prefixed so
+# WordPress's get_plugins() scan ignores it; one backup is kept, the previous
+# one retired first) for manual operator rollback.
+#
+# Lock + flock mirror seed_dir so concurrent/recreated boots on a shared
+# volume cannot interleave a swap; the backup-move plus copy sequence keeps
+# cast/ either fully old or fully new from PHP's point of view. If the swap
+# is interrupted (container dies mid-copy), the next boot sees a different
+# tree and converges again — the MU guard's files-presence gate keeps the
+# site healthy in any transient absence.
+reconcile_cast() {
+    local src="$SRC/wp-content/plugins/cast"
+    local dst="$WP_CONTENT/plugins/cast"
+
+    # No baked Cast in this image (or build without it): nothing to converge.
+    [ -d "$src" ] || return 0
+
+    mkdir -p "$WP_CONTENT/plugins"
+    exec 9>"$WP_CONTENT/plugins/.pinner-cast.lock"
+    flock 9
+
+    if [ -d "$dst" ] && [ "$(same_dir "$src" "$dst")" = yes ]; then
+        flock -u 9
+        exec 9>&-
+        return 0
+    fi
+
+    rm -rf "$WP_CONTENT/plugins"/.cast.bak-[0-9]*
+    if [ -d "$dst" ]; then
+        mv "$dst" "$WP_CONTENT/plugins/.cast.bak-$(date +%s)"
+    fi
+    cp -a "$src"/. "$dst"/
+    chown -R "$APP_USER:$APP_USER" "$dst"
+
+    flock -u 9
+    exec 9>&-
+}
+
+# Copy the image-owned mu-plugins into the ephemeral wp-content. mu-plugins is
+# deliberately NOT a persistent mount (it is platform-owned code, like core),
+# so this runs on every boot: an image update always replaces the guard on the
+# next container start, and there is no user content here to ever preserve.
+seed_mu_plugins() {
+    local src="$SRC/wp-content/mu-plugins"
+    local dst="$WP_CONTENT/mu-plugins"
+
+    mkdir -p "$dst"
+    cp -a "$src"/. "$dst"/
+    chown -R "$APP_USER:$APP_USER" "$dst"
+}
+
 # uploads is never seeded; it only needs an existing, app-owned, writable dir.
 prepare_uploads() {
     local dst="$WP_CONTENT/uploads"
@@ -340,6 +435,8 @@ main() {
     require_db_env
     seed_dir themes
     seed_dir plugins
+    reconcile_cast
+    seed_mu_plugins
     prepare_uploads
     fix_wp_content_ownership
     generate_wp_config
@@ -347,8 +444,10 @@ main() {
     if wait_for_db; then
         if run_wp core is-installed >/dev/null 2>&1; then
             converge_admin_password
+            activate_cast
         else
             auto_install
+            activate_cast
         fi
     else
         echo "WARN: DB not reachable within ${WP_DB_WAIT_TRIES}s; skipping WordPress install this boot (will retry on next boot)." >&2

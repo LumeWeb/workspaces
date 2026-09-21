@@ -27,6 +27,8 @@ variable "WP_CLI_VERSION"     { default = "" }
 variable "WP_CLI_SHA512"      { default = "" }
 variable "GO_BASE"            { default = "" }
 variable "GO_BASE_DIGEST"     { default = "" }
+variable "COMPOSER_BASE"        { default = "" }
+variable "COMPOSER_BASE_DIGEST" { default = "" }
 
 # Publish immutable per-version tags AND a floating `:latest` under the release
 # path. Controlled by the CD release workflow (.github/workflows/release.yml):
@@ -97,6 +99,8 @@ target "wordpress" {
     WP_CLI_SHA512     = WP_CLI_SHA512
     GO_BASE           = GO_BASE
     GO_BASE_DIGEST    = GO_BASE_DIGEST
+    COMPOSER_BASE      = COMPOSER_BASE
+    COMPOSER_BASE_DIGEST = COMPOSER_BASE_DIGEST
   }
   labels = {
     "org.opencontainers.image.base.digest" = PHP_BASE_DIGEST
@@ -105,6 +109,8 @@ target "wordpress" {
     "com.lumeweb.wpcli.version"            = WP_CLI_VERSION
     "com.lumeweb.go-builder.base"          = GO_BASE
     "com.lumeweb.go-builder.digest"        = GO_BASE_DIGEST
+    "com.lumeweb.composer.base"            = COMPOSER_BASE
+    "com.lumeweb.composer.base.digest"     = COMPOSER_BASE_DIGEST
   }
   tags       = concat(
     VERSION == "" ? [] : ["${REGISTRY}/workspace-wordpress:${VERSION}"],

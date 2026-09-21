@@ -87,11 +87,12 @@ admin_email="$(wp user get "$AUTH_USER" --field=user_email --allow-root)"
     && pass "admin '$AUTH_USER' registered with portal owner email ($admin_email)" \
     || die "admin email = '$admin_email', expected '$OWNER_EMAIL'"
 
-echo "== [verify] workspace lockdown (no FS edits, no updates, no web cron) =="
+echo "== [verify] workspace lockdown (no FS edits, install/update allowed, no web cron) =="
 # wp-init.sh bakes these constants into the generated wp-config.php; assert
 # they are LIVE in the generated config (a mere Dockerfile string would pass
-# an image-content grep but not protect the site).
-for c in DISALLOW_FILE_EDIT DISALLOW_FILE_MODS AUTOMATIC_UPDATER_DISABLED DISABLE_WP_CRON; do
+# an image-content grep but not protect the site). Plugin/theme editing stays
+# impossible, but wp-admin plugin install/update must work (no DISALLOW_FILE_MODS).
+for c in DISALLOW_FILE_EDIT AUTOMATIC_UPDATER_DISABLED DISABLE_WP_CRON; do
     val="$(wp config get "$c" --type=constant --allow-root)"
     [ "$val" = "1" ] || die "$c is not enabled in the generated wp-config.php (got: '$val')"
 done
@@ -101,7 +102,12 @@ upd="$(wp config get WP_AUTO_UPDATE_CORE --type=constant --allow-root)"
 case "$upd" in
     1|true|minor|major|beta) die "WP_AUTO_UPDATE_CORE enables core updates (got: '$upd')" ;;
 esac
-pass "DISALLOW_FILE_EDIT/MODS, AUTOMATIC_UPDATER_DISABLED, WP_AUTO_UPDATE_CORE, DISABLE_WP_CRON all active"
+# DISALLOW_FILE_MODS must be GONE ENTIRELY (the old image baked it): any
+# definition, even 0, keeps WP's update/install machinery disabled.
+if mods="$(wp config get DISALLOW_FILE_MODS --type=constant --allow-root 2>/dev/null)" && [ -n "$mods" ]; then
+    die "DISALLOW_FILE_MODS is still defined (got: '$mods'); wp-admin plugin installs/updates would be blocked"
+fi
+pass "DISALLOW_FILE_EDIT, AUTOMATIC_UPDATER_DISABLED, WP_AUTO_UPDATE_CORE, DISABLE_WP_CRON active; DISALLOW_FILE_MODS absent"
 
 echo "== [verify] supervised WP-CLI cron worker =="
 # The worker is a third supervised child (PINNER_SUPERVISED_CMD) driving WP's
@@ -156,6 +162,18 @@ plugins="$(docker exec "$(wp_container)" sh -c 'ls /var/www/html/wp-content/plug
 echo "$plugins" | grep -q akismet || die "bundled plugin akismet missing: $plugins"
 pass "bundled plugin akismet present"
 
+# The platform-managed Cast plugin must be seeded with the volume and active.
+echo "$plugins" | grep -qx cast || die "platform-managed cast plugin missing: $plugins"
+pass "platform-managed cast plugin present on fresh volume"
+
+docker exec "$(wp_container)" sh -c 'test -f /var/www/html/wp-content/mu-plugins/cast-guard.php' \
+    && pass "cast-guard MU plugin present" \
+    || die "cast-guard MU plugin missing (force-on enforcement is dead)"
+
+wp plugin is-active cast --allow-root \
+    || die "cast plugin is not active on a fresh volume (cast guard / activate_cast failed)"
+pass "cast plugin active on fresh volume"
+
 wp theme activate twentytwentyfive --allow-root >/dev/null
 pass "default theme activated"
 
@@ -198,6 +216,14 @@ docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/themes/twe
     && pass "default theme still present after recreation" \
     || die "default theme missing after recreation"
 
+echo "== [verify] cast survives recreation and stays (force-)active =="
+docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/plugins/cast' \
+    && pass "cast plugin survived recreation" \
+    || die "cast plugin missing after recreation"
+wp plugin is-active cast --allow-root \
+    || die "cast plugin not active after recreation"
+pass "cast plugin active after recreation"
+
 echo "== [verify] deleted plugin is not resurrected (marker honoured) =="
 docker exec "$(wp_container)" sh -c 'rm /var/www/html/wp-content/plugins/hello.php'
 $COMPOSE up -d --force-recreate "$SERVICE"
@@ -205,6 +231,45 @@ wait_app
 docker exec "$(wp_container)" sh -c 'test ! -e /var/www/html/wp-content/plugins/hello.php' \
     && pass "deleted bundled plugin was not resurrected" \
     || die "deleted plugin came back (seeding should be one-time)"
+
+echo "== [verify] cast guard is neutral while cast files are missing =="
+# Files are deliberately removed WITHOUT deleting the option entry first:
+# the guard's read filter must keep the phantom cast/cast.php entry out of
+# active_plugins (validate_active_plugins churn) while its directory is
+# absent, i.e. force-on is strictly gated on files presence. WP-CLI resolves
+# a plugin operand by scanning the plugins directory, so the option is
+# deactivated BEFORE the rm below — after deletion, "wp plugin ..." commands
+# for cast fail without ever rewriting the persisted option.
+wp plugin deactivate cast --allow-root >/dev/null
+docker exec "$(wp_container)" sh -c 'rm -rf /var/www/html/wp-content/plugins/cast'
+active_json="$(wp option get active_plugins --format=json --allow-root)"
+echo "$active_json" | grep -q 'cast/cast.php' \
+    && die "cast guard re-added a phantom active-plugins entry while cast files are missing: $active_json" \
+    || pass "cast guard neutral while cast files are missing (option read: $active_json)"
+
+echo "== [verify] boot reconcile restores cast from the image bake =="
+# Recreate: reconcile_cast() converges the volume's cast dir from the image
+# source and activate_cast() performs the real activation transition.
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+docker exec "$(wp_container)" sh -c 'test -f /var/www/html/wp-content/plugins/cast/cast.php' \
+    && pass "cast restored on existing volume by boot reconcile" \
+    || die "cast not restored by boot reconcile"
+wp plugin is-active cast --allow-root \
+    || die "cast not re-activated after reconcile restore"
+
+echo "== [verify] boot reconcile converges a drifted cast copy =="
+# A copy that diverged from the image bake (user edit, partial update) is
+# replaced; the pre-swap copy is archived as plugins/.cast.bak-<epoch>
+# (dot-prefixed so WordPress's get_plugins() scan never sees it).
+docker exec "$(wp_container)" sh -c \
+    'printf "\n// tampered\n" >> /var/www/html/wp-content/plugins/cast/cast.php'
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+docker exec "$(wp_container)" sh -c \
+    'grep -q "// tampered" /var/www/html/wp-content/plugins/cast/cast.php' \
+    && die "boot reconcile did not converge a drifted cast copy to the image bake" \
+    || pass "drifted cast copy converged back to the image bake"
 
 echo "== [verify] per-boot admin password rotation =="
 # Bump WORKSPACE_AUTH_PASSWORD (via compose interpolation) and recreate: the
