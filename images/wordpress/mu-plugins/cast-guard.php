@@ -34,12 +34,12 @@ if (!function_exists('wp_salt') && defined('ABSPATH') && defined('WPINC')) {
 }
 
 /*
- * Force-on only applies while the managed plugin files actually exist. Workspaces
- * whose plugins volume was seeded before Cast shipped (one-time volume seeding
- * never copies onto an initialized volume) must NOT get a phantom
- * active-plugins entry churned in by this filter while its directory is absent;
- * they pick Cast up on the next image redeploy, when the baked version merges
- * into the volume.
+ * Force-on only applies while the managed plugin files actually exist. A
+ * workspace whose cast/ directory is transiently absent (interrupted boot
+ * reconcile, or files deleted out-of-band by an operator) must NOT get a
+ * phantom active-plugins entry churned in by this filter; wp-init.sh's
+ * boot-time reconcile_cast() restores the directory from the image bake on
+ * the next start, after which this filter force-activates again.
  */
 $cast_files_present = static function (): bool {
     return file_exists(constant('WP_PLUGIN_DIR') . '/' . CAST_MAIN);

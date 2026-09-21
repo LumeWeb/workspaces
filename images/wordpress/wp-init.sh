@@ -11,6 +11,8 @@ set -euo pipefail
 #      is a real misconfiguration; refuse to boot rather than run broken).
 #   3. Seed persistent themes/plugins volumes from the immutable source,
 #      despite the fact that the mounts shadow the same paths in the image.
+#   3b. Converge the image-managed Cast plugin into the persistent plugins
+#      volume (install/upgrade/rollback) on EVERY boot.
 #   4. Copy the image-owned mu-plugins (Cast guard) into the ephemeral
 #      wp-content/mu-plugins on EVERY boot (it is not a persistent mount).
 #   5. Leave uploads unseeded (user media only).
@@ -337,6 +339,63 @@ seed_dir() {
     exec 9>&-
 }
 
+# Print "yes" when two directory trees contain byte-identical files (same
+# relative paths, same contents), "no" otherwise. Content-based on purpose: it
+# lets every boot skip an unnecessary replacement without trusting mtimes
+# (cp -a preserves them, but wp-admin plugin edits do not keep them honest).
+same_dir() {
+    local l r
+    l="$(cd "$1" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)"
+    r="$(cd "$2" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)"
+    [ "$l" = "$r" ] && echo yes || echo no
+}
+
+# Converge the image-managed Cast plugin into the plugins volume. Cast is
+# platform-managed like core: the volume's plugins/cast directory (absent,
+# older baked copy, or user-drifted) is reconciled to the copy baked into the
+# image on EVERY boot, so image upgrade and rollback both converge existing
+# workspaces. This is delivery, not activation: activate_cast() below owns the
+# real activation hooks. All other plugins (and wp-admin updates to them) stay
+# under the volume's authority — only cast/ is ever touched here.
+#
+# The replaced copy is archived as plugins/.cast.bak-<epoch> (dot-prefixed so
+# WordPress's get_plugins() scan ignores it; one backup is kept, the previous
+# one retired first) for manual operator rollback.
+#
+# Lock + flock mirror seed_dir so concurrent/recreated boots on a shared
+# volume cannot interleave a swap; the backup-move plus copy sequence keeps
+# cast/ either fully old or fully new from PHP's point of view. If the swap
+# is interrupted (container dies mid-copy), the next boot sees a different
+# tree and converges again — the MU guard's files-presence gate keeps the
+# site healthy in any transient absence.
+reconcile_cast() {
+    local src="$SRC/wp-content/plugins/cast"
+    local dst="$WP_CONTENT/plugins/cast"
+
+    # No baked Cast in this image (or build without it): nothing to converge.
+    [ -d "$src" ] || return 0
+
+    mkdir -p "$WP_CONTENT/plugins"
+    exec 9>"$WP_CONTENT/plugins/.pinner-cast.lock"
+    flock 9
+
+    if [ -d "$dst" ] && [ "$(same_dir "$src" "$dst")" = yes ]; then
+        flock -u 9
+        exec 9>&-
+        return 0
+    fi
+
+    rm -rf "$WP_CONTENT/plugins"/.cast.bak-[0-9]*
+    if [ -d "$dst" ]; then
+        mv "$dst" "$WP_CONTENT/plugins/.cast.bak-$(date +%s)"
+    fi
+    cp -a "$src"/. "$dst"/
+    chown -R "$APP_USER:$APP_USER" "$dst"
+
+    flock -u 9
+    exec 9>&-
+}
+
 # Copy the image-owned mu-plugins into the ephemeral wp-content. mu-plugins is
 # deliberately NOT a persistent mount (it is platform-owned code, like core),
 # so this runs on every boot: an image update always replaces the guard on the
@@ -376,6 +435,7 @@ main() {
     require_db_env
     seed_dir themes
     seed_dir plugins
+    reconcile_cast
     seed_mu_plugins
     prepare_uploads
     fix_wp_content_ownership

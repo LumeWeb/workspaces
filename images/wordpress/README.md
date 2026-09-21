@@ -178,18 +178,21 @@ user content), so delivery is image-owned:
   [`LumeWeb/cast`](https://github.com/LumeWeb/cast) (GitHub codeload tarball;
   deliberately not checksum-pinned yet) with runtime Composer dependencies
   vendored at build time, under `/usr/src/wordpress/wp-content/plugins/cast`.
-- One-time volume seeding delivers it like any bundled plugin. **Already-seeded
-  volumes are not touched** (the never-clobber user-content contract) —
-  reconciling an existing volume with the baked version is a planned
-  boot-convergence step, so *existing* workspaces pick Cast up on their next
-  image redeploy rather than instantly.
+- One-time volume seeding delivers it on fresh volumes. On **already-seeded
+  volumes** a boot-time reconciler (`reconcile_cast()` in `wp-init.sh`)
+  converges only `wp-content/plugins/cast` to the image-baked copy on **every
+  boot** — an image upgrade or rollback delivers the new/older Cast to
+  *existing* workspaces on their next restart. All other plugins stay
+  user-owned (never clobbered); the replaced copy is archived as
+  `plugins/.cast.bak-<epoch>` (dot-prefixed so WordPress's plugin scan
+  ignores it; one backup retained) for manual rollback.
 - A **Cast guard MU plugin** (`mu-plugins/cast-guard.php`, copied into the
   ephemeral `wp-content/mu-plugins` every boot) re-adds `cast/cast.php` to the
   active plugins on every read (only while the plugin's files exist, so a
-  volume seeded before Cast never gets a phantom active entry) and removes the
-  admin Deactivate action — the plugin cannot be turned off. Startup convergence (`wp plugin activate cast`)
-  only performs the real one-time activation transition (schema install,
-  rewrite flush).
+  transiently absent directory never gets a phantom active entry) and removes
+  the admin Deactivate action — the plugin cannot be turned off. Startup
+  convergence (`wp plugin activate cast`) only performs the real one-time
+  activation transition (schema install, rewrite flush).
 
 ## Environment
 

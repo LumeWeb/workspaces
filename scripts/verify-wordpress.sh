@@ -232,26 +232,44 @@ docker exec "$(wp_container)" sh -c 'test ! -e /var/www/html/wp-content/plugins/
     && pass "deleted bundled plugin was not resurrected" \
     || die "deleted plugin came back (seeding should be one-time)"
 
-echo "== [verify] cast guard is neutral while cast files are missing (old volumes) =="
-# Simulate a plugins volume seeded before Cast shipped: remove the plugin dir
-# (the never-clobber contract keeps it absent across recreations). The MU
-# guard must NOT re-add the plugin on the NEXT read — those volumes pick Cast
-# up on their next image redeploy (baked version merge).
+echo "== [verify] cast guard is neutral while cast files are missing =="
+# Files are deliberately removed WITHOUT deleting the option entry first:
+# the guard's read filter must keep the phantom cast/cast.php entry out of
+# active_plugins (validate_active_plugins churn) while its directory is
+# absent, i.e. force-on is strictly gated on files presence. WP-CLI resolves
+# a plugin operand by scanning the plugins directory, so the option is
+# deactivated BEFORE the rm below — after deletion, "wp plugin ..." commands
+# for cast fail without ever rewriting the persisted option.
+wp plugin deactivate cast --allow-root >/dev/null
 docker exec "$(wp_container)" sh -c 'rm -rf /var/www/html/wp-content/plugins/cast'
-# The persisted active_plugins option still holds cast from the earlier
-# activation, and the guard's in_array short-circuit would keep it there.
-# Deactivate to write the option without Cast, so the option read below
-# genuinely exercises the files-presence gate rather than masking it.
-wp plugin deactivate cast --allow-root >/dev/null 2>&1 || true
-$COMPOSE up -d --force-recreate "$SERVICE"
-wait_app
-docker exec "$(wp_container)" sh -c 'test ! -d /var/www/html/wp-content/plugins/cast' \
-    && pass "cast stays absent on a pre-cast volume (one-time seeding)" \
-    || die "cast resurrected despite one-time seeding"
 active_json="$(wp option get active_plugins --format=json --allow-root)"
 echo "$active_json" | grep -q 'cast/cast.php' \
     && die "cast guard re-added a phantom active-plugins entry while cast files are missing: $active_json" \
     || pass "cast guard neutral while cast files are missing (option read: $active_json)"
+
+echo "== [verify] boot reconcile restores cast from the image bake =="
+# Recreate: reconcile_cast() converges the volume's cast dir from the image
+# source and activate_cast() performs the real activation transition.
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+docker exec "$(wp_container)" sh -c 'test -f /var/www/html/wp-content/plugins/cast/cast.php' \
+    && pass "cast restored on existing volume by boot reconcile" \
+    || die "cast not restored by boot reconcile"
+wp plugin is-active cast --allow-root \
+    || die "cast not re-activated after reconcile restore"
+
+echo "== [verify] boot reconcile converges a drifted cast copy =="
+# A copy that diverged from the image bake (user edit, partial update) is
+# replaced; the pre-swap copy is archived as plugins/.cast.bak-<epoch>
+# (dot-prefixed so WordPress's get_plugins() scan never sees it).
+docker exec "$(wp_container)" sh -c \
+    'printf "\n// tampered\n" >> /var/www/html/wp-content/plugins/cast/cast.php'
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+docker exec "$(wp_container)" sh -c \
+    'grep -q "// tampered" /var/www/html/wp-content/plugins/cast/cast.php' \
+    && die "boot reconcile did not converge a drifted cast copy to the image bake" \
+    || pass "drifted cast copy converged back to the image bake"
 
 echo "== [verify] per-boot admin password rotation =="
 # Bump WORKSPACE_AUTH_PASSWORD (via compose interpolation) and recreate: the
