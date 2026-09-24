@@ -299,6 +299,14 @@ out="$(docker exec -u "$want" "$(wp_container)" sh -c \
 [ "$out" = "writable" ] && pass "mounted uploads writable by runtime user (uid $want)" \
     || die "mounted dir not writable by runtime user: '$out'"
 
+# WP only picks the 'direct' filesystem method when the runtime user OWNS the
+# core files it compares against its temp-file probe; root-owned core silently
+# breaks wp-admin plugin installs (unable_to_connect_to_filesystem).
+core_owner="$(docker exec "$(wp_container)" stat -c %u /var/www/html/wp-admin/includes/file.php)"
+[ "$core_owner" = "$want" ] \
+    && pass "WordPress core owned by runtime user (uid $core_owner)" \
+    || die "core not owned by runtime user (file.php uid: $core_owner, want: $want)"
+
 assert_pid1_nonroot "$(wp_container)" "$want"
 assert_nonroot "$(wp_container)" "$want"
 
