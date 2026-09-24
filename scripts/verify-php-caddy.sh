@@ -124,6 +124,27 @@ code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 192.0.2.77' -u "$AUTH_USER:
 [ "$code" = "401" ] || die "proxied public client with bad credentials expected 401, got $code"
 pass "private-range proxy peer forwarding public client in XFF with bad credentials -> 401"
 
+echo "== [php-caddy] chained XFF with spoofed private prefix must not bypass =="
+# Coolify-style proxies APPEND to X-Forwarded-For, so a spoofed leftmost entry
+# arrives as "127.0.0.1, <real-client>". Caddy's default left-to-right XFF
+# parsing resolves client_ip to the spoofed 127.0.0.1 and bypasses auth
+# internet-wide; trusted_proxies_strict parses right-to-left, skipping trusted
+# proxies, and anchors on the rightmost (proxy-appended, attacker-controlled
+# only through the proxy's honest append of the peer it saw) public address.
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 127.0.0.1, 192.0.2.77' "http://web:8080/healthz")"
+[ "$code" = "401" ] || die "chained XFF (spoofed private prefix + public client) expected 401, got $code"
+pass "private peer with chained XFF (spoofed 127.0.0.1 prefix + public client) -> 401"
+
+# A spoofed all-private chain resolves to a private address only because every
+# entry is trusted, which an outside attacker cannot achieve: the real proxy
+# appends the peer it actually saw, so no outside client can make the chain end
+# in a private address served by the proxy. Assert the strict resolver's
+# fallback: an all-trusted chain falls back to the private peer itself (exempt,
+# as with Cast), while the mixed case above stays gated.
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 172.19.0.9, 172.19.0.10' -u "$AUTH_USER:wrongpass" "http://web:8080/healthz")"
+[ "$code" = "200" ] || die "all-private chained XFF via private peer expected 200, got $code"
+pass "private peer with all-private chained XFF -> 200 (in-network exemption)"
+
 echo "== [php-caddy] in-network private client still exempt =="
 # A trusted private-range peer whose XFF chain resolves to a private client
 # (or that sends no XFF at all) stays exempt — Cast's anonymous probe contract.

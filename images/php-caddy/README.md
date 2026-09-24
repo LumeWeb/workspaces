@@ -58,9 +58,15 @@ Behavior:
   the `trusted_proxies` setting (private ranges): a private-range peer's
   `X-Forwarded-For` determines the client IP, while a public-range peer is
   untrusted, so its (attacker-controlled) `X-Forwarded-For` / `X-Real-IP` is
-  ignored and the real peer address is used. A trusted private peer cannot
-  gain a bypass by forging a *public* X-Forwarded-For — that only moves the
-  request into the authenticated "external" set.
+  ignored and the real peer address is used. `trusted_proxies_strict` makes
+  the XFF chain parse right-to-left (first untrusted address, skipping the
+  trusted proxies that append to it): the leftmost entries are
+  client-controlled, so the default left-to-right parsing would let a proxied
+  client spoof `X-Forwarded-For: 127.0.0.1` and bypass auth internet-wide. A
+  client cannot gain a bypass in strict mode either — the proxy appends the
+  peer it actually saw, so the chain never *ends* in a spoofable private
+  value; forging a *public* XFF entry only moves the request into the
+  authenticated "external" set.
 - Trust assumption: the deployment's proxy always sets `X-Forwarded-For`
   (Coolify's Traefik/Caddy do by default). An XFF-less private proxy would
   resolve to its own private IP and be exempt — an accepted part of the

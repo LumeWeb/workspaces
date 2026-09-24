@@ -33,7 +33,11 @@
 # Trust assumptions: private-range peers are trusted, so their forwarding
 # headers resolve the client IP (a public-range client is never trusted, so a
 # direct attacker's spoofed X-Forwarded-For / X-Real-IP is ignored and the
-# real peer is used). The proxy is assumed to always set X-Forwarded-For
+# real peer is used). trusted_proxies_strict (set in the global block above)
+# is required for this to hold against proxied clients: proxies append to
+# X-Forwarded-For, so the leftmost entry is client-controlled; strict parsing
+# scans right-to-left and takes the first untrusted address, the one the proxy
+# actually appended. The proxy is assumed to always set X-Forwarded-For
 # (Traefik/Caddy, Coolify's proxies, do by default); an XFF-less proxy would
 # resolve to its own private IP and be exempt, which is documented as an
 # accepted part of the private-network contract.
@@ -53,12 +57,22 @@
 # an accepted risk: exploiting it means forging forwarded headers on a request
 # that ALREADY originates from inside the deployment's private network —
 # X-Forwarded-Proto/Host influence only scheme/host derivation, and a forged
-# private-range X-Forwarded-For can at most move a request from "authenticated
-# in-network peer" to the auth-exempt private set it would likely already fall
-# into, never grant an outside client a bypass.
+# X-Forwarded-For value would resolve the client to a private address — except
+# that trusted_proxies_strict parses right-to-left, so the proxy-appended
+# rightmost address (never spoofable by an outside client) anchors the
+# decision: a forged private leftmost entry cannot grant an outside client a
+# bypass.
 {
 	servers {
 		trusted_proxies static private_ranges
+		# Parse X-Forwarded-For right-to-left (first untrusted IP) instead of
+		# the default left-to-right scan. With the default, a client behind the
+		# Coolify proxy could spoof a private-range leftmost XFF value (e.g.
+		# "X-Forwarded-For: 127.0.0.1") and have client_ip resolve to it,
+		# bypassing basic auth internet-wide. Strict parsing anchors on the
+		# rightmost, proxy-appended address, which no outside client controls.
+		# Available since Caddy v2.8; this image pins the current stable.
+		trusted_proxies_strict
 	}
 }
 
