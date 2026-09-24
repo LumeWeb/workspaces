@@ -22,7 +22,10 @@ set -euo pipefail
 #      `wp core install` and on every boot converge the admin password to the
 #      current WORKSPACE_AUTH_PASSWORD (credential rotation), and converge the
 #      platform-managed Cast plugin to active (real activation hooks).
-#   8. Fix ownership so www-data can write.
+#   8. Fix ownership so www-data can write, INCLUDING the docroot core: WP's
+#      get_filesystem_method() only picks 'direct' when wp-admin/includes/file.php
+#      is owner-matched with the runtime user's temp-file probe; root-owned core
+#      makes wp-admin plugin installs fall back to FTP and fail closed.
 #
 # This whole block must run as root: Docker/Coolify named volumes can be mounted
 # root:root, and a fresh mount shadows the image content at /var/www/html/wp-content/*.
@@ -118,11 +121,11 @@ compose_db_host() {
 # proceed while the DB is still coming up.
 #
 # Before the WP-CLI call we pre-create an empty wp-config.php owned by www-data
-# so the docroot core (kept root-owned for defence in depth) stays read-only.
+# so the runtime user always owns the file it must rewrite on later boots.
 generate_wp_config() {
     # WP-CLI refuses to overwrite an existing wp-config.php without --force, and
     # the runtime user must be able to write it. Pre-create a private blank file
-    # owned by www-data; core files remain root-owned/read-only.
+    # owned by www-data.
     : > "$DOCROOT/wp-config.php"
     chown "$APP_USER:$APP_USER" "$DOCROOT/wp-config.php"
     chmod 600 "$DOCROOT/wp-config.php"
@@ -418,6 +421,21 @@ prepare_uploads() {
     fi
 }
 
+# Chown the copied core to the app user. Comparison the OS cannot fake: WP's
+# get_filesystem_method() returns 'direct' only if the owner of
+# wp-admin/includes/file.php matches the freshly-written temp file's owner (the
+# FPM user's uid). Root-owned core (cp -a from /usr/src) fails that comparison,
+# so wp-admin plugin installs degrade to FTP/credentials and die with
+# unable_to_connect_to_filesystem. Re-run every boot (seed_core is one-time per
+# container, so seed-only chowning would miss recreated docroots) and
+# deliberately does NOT recurse into wp-content, whose persistent mounts can be
+# arbitrarily large (uploads).
+fix_core_ownership() {
+    chown "$APP_USER:$APP_USER" "$DOCROOT"
+    chown -R "$APP_USER:$APP_USER" "$DOCROOT/wp-admin" "$DOCROOT/wp-includes"
+    find "$DOCROOT" -maxdepth 1 -type f -exec chown "$APP_USER:$APP_USER" {} +
+}
+
 # Make the ephemeral wp-content tree (and its non-mounted subdirs) writable by
 # the app user without recursing into the (possibly large) mounted uploads dir.
 fix_wp_content_ownership() {
@@ -432,6 +450,7 @@ fix_wp_content_ownership() {
 
 main() {
     seed_core
+    fix_core_ownership
     require_db_env
     seed_dir themes
     seed_dir plugins
