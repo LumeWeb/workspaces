@@ -13,21 +13,30 @@
 # is never baked into the image, written to disk, or echoed to logs — it lives
 # only transiently in the process environment.
 #
-# Loopback + private-network exemption: direct requests whose real peer IP is
+# Loopback + private-network exemption: requests whose resolved client IP is
 # 127.0.0.1, ::1, or an RFC1918/ULA private address bypass auth. Loopback
 # covers the container's own Docker/Coolify health probe
-# (curl localhost:${PORT}/healthz). Private ranges cover in-deployment peers
-# that the published-port hairpin NATs (e.g. the bridge gateway when a service
-# inside the deployment's Docker network requests the public URL, as Cast's
-# anonymous export probe and capture fetches do via wp_remote_get(home_url)).
-# Exposing the site to such in-network peers is the existing contract: TLS and
-# public ingress already terminate on a private-network peer (the Coolify
-# proxy), so "protect from the internet" is the threat model, not
-# "protect from the deployment's own network". The bypass keys on the actual
-# TCP peer via Caddy's remote_ip matcher — NEVER on spoofable
-# X-Forwarded-For / X-Real-IP headers, which this matcher ignores by default
-# (trusted_proxies below influences only forwarded-header handling, never the
-# remote_ip matcher).
+# (curl localhost:${PORT}/healthz), which sends no forwarded headers. Private
+# ranges cover in-deployment peers: the upstream Coolify proxy connects from a
+# private address and forwards each public client's real (public-range) IP in
+# X-Forwarded-For, while in-deployment services that request the public URL
+# (as Cast's anonymous export probe and capture fetches do via
+# wp_remote_get(home_url)) arrive either with a private-range XFF hop or as a
+# direct hairpinned private peer — all resolve to a private client IP.
+#
+# The bypass therefore keys on Caddy's client_ip matcher, which resolves the
+# client IP through the trusted_proxies below (+ X-Forwarded-For), NOT on the
+# raw TCP peer alone. This matters because the Coolify proxy's own private
+# peer address would exempt ALL proxied traffic if the bypass keyed on
+# remote_ip — public clients must still authenticate.
+#
+# Trust assumptions: private-range peers are trusted, so their forwarding
+# headers resolve the client IP (a public-range client is never trusted, so a
+# direct attacker's spoofed X-Forwarded-For / X-Real-IP is ignored and the
+# real peer is used). The proxy is assumed to always set X-Forwarded-For
+# (Traefik/Caddy, Coolify's proxies, do by default); an XFF-less proxy would
+# resolve to its own private IP and be exempt, which is documented as an
+# accepted part of the private-network contract.
 #
 # The workspace always runs behind the upstream Coolify proxy, which terminates
 # TLS and forwards plain HTTP on a private network. Caddy by default treats
@@ -41,9 +50,12 @@
 # private_ranges is as narrow as a generic image can get: the upstream proxy's
 # source IP varies per deployment (Podman/Docker bridge, overlay network), so
 # the exact CIDR cannot be pinned at build time. Trusting all private peers is
-# an accepted risk: exploiting it means forging X-Forwarded-Proto/Host on a
-# request that ALREADY originates from inside the deployment's private network,
-# and the headers only influence scheme/host derivation, never authorization.
+# an accepted risk: exploiting it means forging forwarded headers on a request
+# that ALREADY originates from inside the deployment's private network —
+# X-Forwarded-Proto/Host influence only scheme/host derivation, and a forged
+# private-range X-Forwarded-For can at most move a request from "authenticated
+# in-network peer" to the auth-exempt private set it would likely already fall
+# into, never grant an outside client a bypass.
 {
 	servers {
 		trusted_proxies static private_ranges
@@ -56,13 +68,16 @@
 	root * /var/www/html
 	encode gzip
 
-	# Enforce HTTP Basic Auth on every request from outside the private
-	# network (including /healthz): the health path is only ever probed from
-	# localhost by the container health check, so a non-exempt /healthz is
-	# just another gated route. The username and derived hash names are provided by the
+	# Enforce HTTP Basic Auth on every request whose resolved client IP is
+	# outside the loopback/private set (including /healthz): the health path is
+	# only ever probed from localhost by the container health check, so a
+	# non-exempt /healthz is just another gated route. client_ip (not
+	# remote_ip) is required here: every proxied request's TCP peer is the
+	# private-range Coolify proxy, so a peer-based matcher would exempt the
+	# entire internet. The username and derived hash names are provided by the
 	# auth setup step; missing/invalid WORKSPACE_AUTH_* fails the container
 	# at start, so this block is always populated when Caddy runs.
-	@external not remote_ip 127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+	@external not client_ip 127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
 	basicauth @external {
 		{$WORKSPACE_AUTH_USERNAME} {$WORKSPACE_AUTH_HASH}
 	}

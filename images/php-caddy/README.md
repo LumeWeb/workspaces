@@ -2,7 +2,8 @@
 
 Reusable base image: **PHP-FPM + Caddy**, the runtime every Pinner workspace
 image builds on. Non-root after startup, no integrated app logic. Enforces
-workspace HTTP Basic Auth on public (non-loopback) requests.
+workspace HTTP Basic Auth on requests whose resolved client IP is public
+(proxied public clients included).
 
 | Aspect | Value |
 |---|---|
@@ -26,28 +27,44 @@ the same values) and rebuild. Verify with `make deps-verify`.
 ## HTTP Basic Auth (portal-plugin-ipfs PR #1031)
 
 The Pinner portal injects two **secret** environment variables, and this image
-enforces them with Caddy's `basicauth` on every request from an **external**
-(public-address) peer:
+enforces them with Caddy's `basicauth` on every request whose **resolved client
+IP** is external (public-range):
 
 - `WORKSPACE_AUTH_USERNAME`
 - `WORKSPACE_AUTH_PASSWORD`
 
 Behavior:
 
-- **External** requests (the actual TCP peer is a public address) must present
-  valid HTTP Basic Auth credentials, otherwise they get `401`.
-- **Loopback** requests (real peer `127.0.0.1` or `::1`) and **private-network**
+- **External** requests (resolved client IP is a public address) must present
+  valid HTTP Basic Auth credentials, otherwise they get `401`. This includes
+  every request forwarded by the Coolify proxy for a public client: the proxy
+  is a private-range trusted peer whose `X-Forwarded-For` carries the real
+  public client IP. Keying the bypass on the raw TCP peer instead would exempt
+  the proxy's own private-range peer address and silently disable auth for the
+  whole internet.
+- **Loopback** requests (client IP `127.0.0.1` or `::1`) and **private-network**
   requests (RFC 1918 / ULA ranges: `10.0.0.0/8`, `172.16.0.0/12`,
   `192.168.0.0/16`, `fc00::/7`) bypass auth. Loopback covers the container's
-  own Docker/Coolify health probe of `/healthz`. Private-network coverage keeps
-  in-deployment consumers — the Coolify proxy's plain-HTTP hop, and any service
-  inside the deployment's Docker network that requests the workspace's *public*
-  URL and arrives hairpinned through the published port with the bridge
-  gateway as its peer (e.g. Cast's anonymous export probe and capture fetches
-  via `wp_remote_get(home_url('/'))`) — outside "the internet" in the auth
+  own Docker/Coolify health probe of `/healthz` (it sends no forwarded
+  headers, so its client IP is the loopback peer itself). Private-network
+  coverage keeps in-deployment consumers — the Coolify proxy's plain-HTTP hop
+  for private-range forwarded clients, and any service inside the deployment's
+  Docker network that requests the workspace's *public* URL (e.g. Cast's
+  anonymous export probe and capture fetches via
+  `wp_remote_get(home_url('/'))`, arriving with a private-range XFF hop or as
+  a direct hairpinned private peer) — outside "the internet" in the auth
   threat model. The portal itself never HTTP-probes the workspace URL.
-- The bypass keys on Caddy's `remote_ip` matcher — the **real peer IP**, never
-  spoofable `X-Forwarded-For` / `X-Real-IP` headers.
+- The bypass resolves the client IP with Caddy's `client_ip` matcher through
+  the `trusted_proxies` setting (private ranges): a private-range peer's
+  `X-Forwarded-For` determines the client IP, while a public-range peer is
+  untrusted, so its (attacker-controlled) `X-Forwarded-For` / `X-Real-IP` is
+  ignored and the real peer address is used. A trusted private peer cannot
+  gain a bypass by forging a *public* X-Forwarded-For — that only moves the
+  request into the authenticated "external" set.
+- Trust assumption: the deployment's proxy always sets `X-Forwarded-For`
+  (Coolify's Traefik/Caddy do by default). An XFF-less private proxy would
+  resolve to its own private IP and be exempt — an accepted part of the
+  private-network contract below.
 - **Fail closed**: if either `WORKSPACE_AUTH_*` var is missing/empty at start,
   the container refuses to start rather than serve the workspace publicly
   unauthenticated. This matches the portal's environment builder, which fails
@@ -74,16 +91,21 @@ the global `servers > trusted_proxies static private_ranges` option: requests
 from the private-network proxy are trusted and their forwarded headers
 (`X-Forwarded-Proto` / `X-Forwarded-Host`) reach the application unmodified.
 This keeps WordPress `is_ssl()` correct behind TLS termination and avoids the
-`force_ssl_admin()` login redirect loop. The trust setting does **not** relax
-the Basic Auth bypass, which continues to key on the real peer IP (`remote_ip`),
-never on forwarded headers.
+`force_ssl_admin()` login redirect loop. The same trust decision is what makes
+the Basic Auth bypass resolve the real client IP: a private-range peer's
+forwarded headers honor `X-Forwarded-For`, while a public-range (untrusted)
+peer's spoofed headers are ignored.
 
 `private_ranges` is as narrow as a generic image can be pinned to: the upstream
 proxy's source IP varies per deployment (Docker bridge / overlay network), so an
 exact proxy CIDR cannot be known at build time. Trusting all private-range peers
 is an accepted risk: an attacker would need to already sit on the deployment's
-private network, and the forwarded headers only influence scheme/host
-derivation in the application — never authorization.
+private network. Forged `X-Forwarded-Proto` / `X-Forwarded-Host` influence only
+scheme/host derivation in the application; a forged *private-range*
+`X-Forwarded-For` can at most move a request from the authenticated
+"in-network peer" case into the auth-exempt private set it would already fall
+into, and a forged *public-range* one strictly requires more auth — never a
+bypass for an outside client.
 
 ## Health
 

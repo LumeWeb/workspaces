@@ -3,9 +3,10 @@
 # the workspace HTTP Basic Auth contract (portal-plugin-ipfs PR #1031), and
 # assert the final Caddy/PHP-FPM processes are non-root.
 #
-# Auth contract under test (the bypass keys on the real TCP peer via Caddy's
-# remote_ip matcher; loopback and private-network peers are in-deployment and
-# exempt — see images/php-caddy/Caddyfile):
+# Auth contract under test (the bypass resolves the client IP via Caddy's
+# client_ip matcher through trusted_proxies + X-Forwarded-For; loopback and
+# private-network resolved client IPs are in-deployment and exempt — see
+# images/php-caddy/Caddyfile):
 #   - public-range peer without credentials -> 401 (via the TEST-NET-1
 #     ${compose}_publictest network, so the peer is genuinely 192.0.2.x)
 #   - valid credentials -> 200 / app access
@@ -13,8 +14,15 @@
 #   - private-network peer (RFC1918/ULA) -> 200 with NO credentials
 #     (in-deployment peer: the container's Docker network, and every
 #     published-port hairpin NAT, falls under this case)
+#   - proxied public client (private-range proxy peer forwarding a
+#     public-range X-Forwarded-For) -> 401 with NO credentials:
+#     the production regression case — a peer-based bypass would exempt the
+#     whole internet because every proxied request's TCP peer is private
 #   - loopback /healthz (127.0.0.1) -> 200 with NO credentials
 #   - spoofed X-Forwarded-For / X-Real-IP never bypass auth on a public peer
+#     (public-range peer is not a trusted proxy, so its headers are ignored)
+#   - a trusted private peer forging a PUBLIC X-Forwarded-For can only ever
+#     require MORE auth, never gain a bypass
 #   - IPv6 loopback (::1) bypass -> 200 when the environment supports it
 #   - auth always required (no silent auth-disabled mode): the contract’s
 #     environment builder fails closed, so there is deliberately no
@@ -98,10 +106,35 @@ code="$(peer_curl "$PRIVATENET" "http://web:8080/healthz")"
 [ "$code" = "200" ] || die "private-peer no-auth expected 200, got $code"
 pass "private-network peer without credentials -> 200"
 
+echo "== [php-caddy] proxied public client must NOT bypass auth (regression case) =="
+# Production topology: the Coolify proxy is a private-range peer that forwards
+# each public client's real IP in X-Forwarded-For. Keying the bypass on the
+# raw TCP peer (remote_ip) exempted ALL proxied traffic and silently disabled
+# auth; the client_ip resolver through trusted_proxies must still require
+# credentials when the forwarded client is a public-range address.
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 192.0.2.77' "http://web:8080/healthz")"
+[ "$code" = "401" ] || die "proxied public client (private peer + public XFF) expected 401, got $code"
+pass "private-range proxy peer forwarding public client in XFF -> 401 (no credentials)"
+
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 192.0.2.77' -u "$AUTH_USER:$AUTH_PASS" "http://web:8080/healthz")"
+[ "$code" = "200" ] || die "proxied public client with valid credentials expected 200, got $code"
+pass "private-range proxy peer forwarding public client in XFF with valid credentials -> 200"
+
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 192.0.2.77' -u "$AUTH_USER:wrongpass" "http://web:8080/healthz")"
+[ "$code" = "401" ] || die "proxied public client with bad credentials expected 401, got $code"
+pass "private-range proxy peer forwarding public client in XFF with bad credentials -> 401"
+
+echo "== [php-caddy] in-network private client still exempt =="
+# A trusted private-range peer whose XFF chain resolves to a private client
+# (or that sends no XFF at all) stays exempt — Cast's anonymous probe contract.
+code="$(peer_curl "$PRIVATENET" -H 'X-Forwarded-For: 172.19.0.9' "http://web:8080/healthz")"
+[ "$code" = "200" ] || die "private client via private peer with private XFF expected 200, got $code"
+pass "private-range peer with private-range XFF -> 200 (no credentials)"
+
 echo "== [php-caddy] spoofed forwarding headers must not bypass auth =="
-# The bypass keys on Caddy's remote_ip (the real TCP peer of the request). A
-# spoofed X-Forwarded-For/X-Real-IP claiming loopback must NOT exempt a
-# public-range request, because its actual peer is 192.0.2.x.
+# A public-range peer is not a trusted proxy, so Caddy's client_ip resolver
+# ignores its forged X-Forwarded-For/X-Real-IP (claiming loopback) and keys on
+# the real 192.0.2.x address: still 401.
 code="$(peer_curl "$PUBLICNET" -H 'X-Forwarded-For: 127.0.0.1' -H 'X-Real-IP: 127.0.0.1' "http://web:8080/healthz")"
 [ "$code" = "401" ] || die "spoofed XFF/X-Real-IP must not bypass auth, got $code"
 pass "spoofed X-Forwarded-For/X-Real-IP (claiming loopback) from public peer -> 401"
@@ -113,11 +146,16 @@ code="$(docker exec "$container" curl -s -o /dev/null -w '%{http_code}' "http://
 [ "$code" = "200" ] || die "loopback /healthz (127.0.0.1) expected 200, got $code"
 pass "loopback /healthz (127.0.0.1) returns 200 with NO credentials"
 
-# Loopback is genuinely exempt regardless of spoofed headers (the matcher
-# never inspects them); this asserts peer-IP-based bypass, not header trust.
+# Loopback is a trusted peer, so a forwarded foreign PUBLIC client resolves to
+# that public address and is correctly gated; the container health check never
+# sends XFF, so the real probe path stays exempt (asserted above).
 code="$(docker exec "$container" curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 8.8.8.8' -H 'X-Real-IP: 8.8.8.8' "http://127.0.0.1:8080/healthz")"
-[ "$code" = "200" ] || die "loopback + foreign XFF expected 200, got $code"
-pass "loopback /healthz + foreign X-Forwarded-For/X-Real-IP still 200 (peer-based bypass)"
+[ "$code" = "401" ] || die "loopback + public-range forwarded client expected 401, got $code"
+pass "loopback peer forwarding public client in XFF -> 401 (trusted-peer header resolution)"
+
+code="$(docker exec "$container" curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 127.0.0.1' "http://127.0.0.1:8080/healthz")"
+[ "$code" = "200" ] || die "loopback + loopback XFF expected 200, got $code"
+pass "loopback /healthz + loopback X-Forwarded-For still 200 (private resolved client)"
 
 echo "== [php-caddy] IPv6 loopback (::1) bypass (if supported) =="
 if docker exec "$container" curl -s -o /dev/null -w '%{http_code}' 'http://[::1]:8080/healthz' >/dev/null 2>&1; then

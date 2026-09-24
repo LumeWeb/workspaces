@@ -221,11 +221,15 @@ the portal via `PORTAL_API_KEY` / `COOLIFY_URL`.
 Public HTTP Basic Auth is enforced **by the image's Caddy layer** from the
 `WORKSPACE_AUTH_USERNAME` / `WORKSPACE_AUTH_PASSWORD` secret env vars injected
 by the portal (portal-plugin-ipfs PR #1031) — it is no longer the Coolify
-proxy's responsibility. All non-loopback requests require valid credentials
-(`401` otherwise); loopback requests (real peer `127.0.0.1` / `::1`) bypass
-auth so the container's Docker health check of `/healthz` passes. The bypass
-never trusts spoofable `X-Forwarded-For` / `X-Real-IP`. Missing credentials
-fail the container closed. See [`images/php-caddy/README.md`](../php-caddy/README.md).
+proxy's responsibility. All requests with a public-range resolved client IP
+require valid credentials (`401` otherwise) — including every request the
+Coolify proxy forwards for a public client; loopback requests (client IP
+`127.0.0.1` / `::1`) and private-network clients bypass auth so the container's
+Docker health check of `/healthz` and in-deployment probes (e.g. Cast) pass.
+The bypass resolves the client IP via Caddy's `client_ip` through
+`trusted_proxies`: a public-range peer's spoofed `X-Forwarded-For` /
+`X-Real-IP` is ignored (untrusted peer). Missing credentials fail the
+container closed. See [`images/php-caddy/README.md`](../php-caddy/README.md).
 
 ## Security trade-off (privilege drop)
 

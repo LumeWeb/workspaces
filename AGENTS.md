@@ -23,11 +23,18 @@ first image is `wordpress` (WordPress served by Caddy on PHP-FPM).
 - `/healthz` is a dedicated PHP-backed endpoint that returns `200`, reached
   by the container's own Docker/Coolify health check from `localhost`. HTTP
   Basic Auth is enforced **by the image** (Caddy) from the `WORKSPACE_AUTH_*`
-  secret env vars (portal-plugin-ipfs PR #1031) on requests from **external**
-  (public-address) peers; loopback and private-network (RFC1918/ULA) peers
-  bypass it via Caddy's `remote_ip` (real peer, never spoofable forwarding
-  headers). Missing/invalid `WORKSPACE_AUTH_*` fails the container closed. Do
-  not weaken this to trust forwarding headers or to add an auth-disabled mode.
+  secret env vars (portal-plugin-ipfs PR #1031) on requests whose **resolved
+  client IP** is external (public-range); loopback and private-network
+  (RFC1918/ULA) resolved clients bypass it via Caddy's `client_ip` (resolved
+  through `trusted_proxies`: the private-range Coolify proxy's
+  `X-Forwarded-For`, or the raw peer when there is no forwarded chain — so a
+  proxied public client still authenticates while in-network peers and the
+  localhost health probe stay exempt). Direct spoofed forwarding headers from a
+  public peer are ignored (untrusted peer). Missing/invalid
+  `WORKSPACE_AUTH_*` fails the container closed. Do not weaken this to an
+  auth-disabled mode or to a peer-IP-based (`remote_ip`) bypass — that would
+  exempt the private-range proxy peer and silently disable auth for the whole
+  internet.
 - The **Cast** plugin is platform-managed: baked from the latest GitHub
   `develop` tree snapshot (Composer deps vendored at build; not checksum-pinned
   yet) and force-kept active by an image-owned MU plugin. Plugin/theme editing
