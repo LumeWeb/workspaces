@@ -141,13 +141,15 @@ it as a named context (`contexts.base = target:php-caddy`).
 - **`/healthz`**: dedicated PHP-backed health probe, **loopback-exempt** (the
   container's Docker health check reaches it from `localhost` without auth).
 - **HTTP Basic Auth**: enforced by the image from the `WORKSPACE_AUTH_USERNAME`
-  / `WORKSPACE_AUTH_PASSWORD` secret env vars on all requests from **external**
-  (public-address) peers (portal-plugin-ipfs PR #1031) — not by the Coolify
-  proxy. Bypass keys on the real peer IP (`remote_ip`) for loopback and
-  private-network (RFC1918/ULA) peers — in-deployment probes (e.g. Cast's
-  anonymous export probe hairpinning through the published port) and the health
-  check stay unauthenticated; never spoofable forwarding headers; missing
-  credentials fail the container closed.
+  / `WORKSPACE_AUTH_PASSWORD` secret env vars on all requests whose **resolved
+  client IP** is external/public (portal-plugin-ipfs PR #1031) — including
+  every proxied request where the Coolify proxy forwards a public-range
+  `X-Forwarded-For` — not by the Coolify proxy. Bypass keys on the
+  private-range resolved client IP via Caddy's `client_ip` through
+  `trusted_proxies`: in-deployment probes (e.g. Cast's anonymous export probe
+  hairpinning through the published port) and the health check stay
+  unauthenticated; a public-range peer's spoofed forwarding headers are
+  ignored (untrusted); missing credentials fail the container closed.
 - DB via `WORDPRESS_DB_HOST/PORT/NAME/USER/PASSWORD`; public URL via
   `COOLIFY_URL` (sets `WP_HOME`/`WP_SITEURL` and drives `wp core install`);
   `X-Forwarded-*` drives HTTPS-correct links.
