@@ -180,10 +180,12 @@ pass "cast plugin active on fresh volume"
 # `wp plugin is-active` alone PASSES via the guard's read filter and must
 # never be trusted as proof of activation.
 # NB: `wp db tables` lists core tables only; custom tables must be probed
-# directly.
+# directly. The expected name is derived from the live $wpdb->prefix (the
+# table prefix is configurable and not assumed to be the wp_ default).
+prefix="$(wp eval 'global $wpdb; echo (string) $wpdb->prefix;' --allow-root)"
 table="$(wp eval 'global $wpdb; echo (string) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", "{$wpdb->prefix}cast_export_items" ) );' --allow-root)"
-[ "$table" = "wp_cast_export_items" ] \
-    || die "cast plugin is active but wp_cast_export_items was never installed (activation hook did not run)"
+[ "$table" = "${prefix}cast_export_items" ] \
+    || die "cast plugin is active but ${prefix}cast_export_items was never installed (activation hook did not run)"
 pass "cast export-items table installed on fresh volume"
 
 cast_version="$(wp eval 'echo (string) get_option( "cast_version" );' --allow-root)"
@@ -250,7 +252,7 @@ wp eval 'global $wpdb; $wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}cast_e
 $COMPOSE up -d --force-recreate "$SERVICE"
 wait_app
 table="$(wp eval 'global $wpdb; echo (string) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", "{$wpdb->prefix}cast_export_items" ) );' --allow-root)"
-[ "$table" = "wp_cast_export_items" ] \
+[ "$table" = "${prefix}cast_export_items" ] \
     || die "activate_cast did not self-heal a lost cast schema on the next boot"
 pass "lost cast schema restored by next boot's real activation"
 
