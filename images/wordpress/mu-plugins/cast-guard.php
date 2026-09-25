@@ -49,9 +49,18 @@ $cast_files_present = static function (): bool {
  * Re-add Cast on EVERY read of the active_plugins option, regardless of how it
  * was last written (admin Deactivate, WP-CLI, REST). A read-time filter means
  * Cast is "active" again before the next request boots, so no separate boot run
- * is needed for enforcement — wp-init.sh's `wp plugin activate cast` only
- * performs the REAL one-time activation transition (schema install, rewrite
- * flush); it is not the enforcement mechanism.
+ * is needed for enforcement — wp-init.sh's boot-time `activate_cast()` owns the
+ * REAL activation transition (schema install, rewrite flush); this filter is
+ * not the activation mechanism and must not be.
+ *
+ * WP_INSTALLING exemption: while core's installation/upgrader machinery drives
+ * a real activation flow (including wp-init.sh's boot reconciler, which runs
+ * deactivate_plugins() + activate_plugin() under this constant), the filter
+ * must stay out of the way. Force-on reads would make activate_plugin()'s
+ * own get_option('active_plugins') show Cast as already present, silently
+ * skipping the activation block — the exact regression in which the plugin
+ * is "active" while its schema was never installed. Core itself relies on
+ * this constant during wp core install/upgrade; the same honest read applies.
  *
  * Not hooked: pre_option_active_plugins would also defeat legitimate core
  * logic that manages the option; return-value filtering after the read keeps
@@ -60,6 +69,10 @@ $cast_files_present = static function (): bool {
 add_filter(
     'option_active_plugins',
     static function (array $plugins) use ($cast_files_present): array {
+        if (defined('WP_INSTALLING') && WP_INSTALLING) {
+            return $plugins;
+        }
+
         if (in_array(CAST_MAIN, $plugins, true) || !$cast_files_present()) {
             return $plugins;
         }
@@ -78,6 +91,10 @@ add_filter(
 add_filter(
     'site_option_active_sitewide_plugins',
     static function (array $sitewide) use ($cast_files_present): array {
+        if (defined('WP_INSTALLING') && WP_INSTALLING) {
+            return $sitewide;
+        }
+
         if (!array_key_exists(CAST_MAIN, $sitewide) && $cast_files_present()) {
             $sitewide[CAST_MAIN] = true;
         }

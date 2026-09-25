@@ -174,6 +174,25 @@ wp plugin is-active cast --allow-root \
     || die "cast plugin is not active on a fresh volume (cast guard / activate_cast failed)"
 pass "cast plugin active on fresh volume"
 
+# The activation transition must have actually RUN: a guard-only "active"
+# state without CastActivator leaves no schema and no version marker — the
+# exact regression where the publish pipeline then 500s on a missing table.
+# `wp plugin is-active` alone PASSES via the guard's read filter and must
+# never be trusted as proof of activation.
+# NB: `wp db tables` lists core tables only; custom tables must be probed
+# directly. The expected name is derived from the live $wpdb->prefix (the
+# table prefix is configurable and not assumed to be the wp_ default).
+prefix="$(wp eval 'global $wpdb; echo (string) $wpdb->prefix;' --allow-root)"
+table="$(wp eval 'global $wpdb; echo (string) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", "{$wpdb->prefix}cast_export_items" ) );' --allow-root)"
+[ "$table" = "${prefix}cast_export_items" ] \
+    || die "cast plugin is active but ${prefix}cast_export_items was never installed (activation hook did not run)"
+pass "cast export-items table installed on fresh volume"
+
+cast_version="$(wp eval 'echo (string) get_option( "cast_version" );' --allow-root)"
+[ -n "$cast_version" ] \
+    || die "cast is active but the cast_version option was never set (activation hook did not run)"
+pass "cast_version recorded ($cast_version)"
+
 wp theme activate twentytwentyfive --allow-root >/dev/null
 pass "default theme activated"
 
@@ -223,6 +242,19 @@ docker exec "$(wp_container)" sh -c 'test -d /var/www/html/wp-content/plugins/ca
 wp plugin is-active cast --allow-root \
     || die "cast plugin not active after recreation"
 pass "cast plugin active after recreation"
+
+echo "== [verify] activate_cast self-heals a DB whose cast schema was lost =="
+# Simulates damaged/rolled-back state: plugin stays active in the option but
+# the schema and version marker are gone. The per-boot REAL activation cycle
+# (deactivate_plugins silent + activate_plugin under WP_INSTALLING, with the
+# guard's force-on standing down) must reinstall the schema.
+wp eval 'global $wpdb; $wpdb->query( "DROP TABLE IF EXISTS {$wpdb->prefix}cast_export_items" ); delete_option( "cast_version" );' --allow-root >/dev/null
+$COMPOSE up -d --force-recreate "$SERVICE"
+wait_app
+table="$(wp eval 'global $wpdb; echo (string) $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", "{$wpdb->prefix}cast_export_items" ) );' --allow-root)"
+[ "$table" = "${prefix}cast_export_items" ] \
+    || die "activate_cast did not self-heal a lost cast schema on the next boot"
+pass "lost cast schema restored by next boot's real activation"
 
 echo "== [verify] deleted plugin is not resurrected (marker honoured) =="
 docker exec "$(wp_container)" sh -c 'rm /var/www/html/wp-content/plugins/hello.php'
