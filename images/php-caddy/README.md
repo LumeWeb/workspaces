@@ -113,6 +113,36 @@ scheme/host derivation in the application; a forged *private-range*
 into, and a forged *public-range* one strictly requires more auth — never a
 bypass for an outside client.
 
+## Logging
+
+PHP application logs — `error_log()` calls, PHP warnings/errors, and anything
+workers write to stderr after `fastcgi_finish_request()` — appear in the
+container log stream (`docker logs`, shown as-is by Coolify), tagged by FPM:
+
+```
+WARNING: [pool www] child 8 said into stderr: "NOTICE: PHP message: …"
+```
+
+How: PHP-FPM writes its whole error sink — including everything captured by
+`catch_workers_output` — to a www-data-owned file (`/var/www/log/php-fpm.log`),
+and the supervisor (`pinner-supervise.sh`) relays that file into the
+container's stderr with a `[php]` line prefix via `tail -F` (late-created file
+and log rotation both handled).
+
+Why the detour through a file: this is the non-root counterpart of the
+official `php` images' `error_log = /proc/self/fd/2`. The FPM master here runs
+as www-data and must `open()` the log path itself (unlike Caddy, which merely
+inherits its open fds), and the kernel's *reopen* of the container's
+root-owned log pipe through procfs is nondeterministically denied for
+www-data (observed under `docker compose` and plain `docker run` alike). A
+file www-data owns is deterministic and logs are never lost even if the relay
+dies — they just stop being streamed. The relay is therefore deliberately
+unsupervised: it is a best-effort mirror, never a site-killing dependency.
+
+`display_errors` is off and `fastcgi.logging` is off (`php.ini`): errors never
+leak into HTTP responses and are captured exactly once by FPM rather than also
+forwarded upstream to Caddy.
+
 ## Health
 
 `GET /healthz` returns `200` and is routed **through PHP-FPM** (`healthz.php`),
