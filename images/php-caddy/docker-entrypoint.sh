@@ -22,6 +22,23 @@ fi
 # preserves the environment) into the supervisor and, from there, Caddy.
 . /usr/local/bin/pinner-auth-setup.sh
 
+# PHP log relay: stream PHP-FPM's error log — the single sink of all PHP
+# application logs (error_log(), PHP warnings/errors captured by FPM's
+# catch_workers_output) — into the container's stderr, so docker/Coolify
+# `docker logs` carry them tagged "[php]". FPM writes to that file because the
+# non-root master cannot reopen the container's root-owned log pipe (see
+# php-fpm.conf); this relay is what makes the same bytes visible to the
+# orchestrator. It is a sibling of the exec'd supervisor (which never waits on
+# it), deliberately unsupervised: this is a best-effort mirror — if it dies the
+# site keeps serving; logs keep accumulating in the file, just not streamed.
+# The container runtime tears it down with the container. Started as www-data
+# (it only reads that www-data-owned file), with its own TERM trap reset to the
+# kernel default so it never inherits/executes a parent's signal handler.
+setpriv --reuid=www-data --regid=www-data --init-groups sh -c '
+    trap - TERM INT QUIT
+    tail -F -n 0 /var/www/log/php-fpm.log 2>/dev/null | sed -u "s/^/[php] /"
+' >&2 &
+
 # Drop privileges for the entire rest of the process tree. setpriv keeps the
 # same environment and execs the supervisor as www-data, so both Caddy and
 # PHP-FPM (and every process they spawn) are non-root from here on.

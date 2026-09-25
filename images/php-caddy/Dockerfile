@@ -172,7 +172,9 @@ ENV PINNER_INIT=""
 # these dirs, so pre-provision and own them here.
 # /var/www/log is where the non-root PHP-FPM master writes its error log (it
 # cannot reopen the container's root-owned stdout pipe). Created here and owned
-# by www-data so FPM can create the log file at startup.
+# by www-data so FPM can create the log file at startup; pinner-supervise.sh
+# relays this file into the container log stream so PHP logs reach
+# docker/Coolify logs.
 RUN mkdir -p /var/www/.config/caddy /var/www/.local/share/caddy /var/www/log \
  && chown -R www-data:www-data /var/www
 

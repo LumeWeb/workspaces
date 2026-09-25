@@ -190,6 +190,27 @@ else
     echo "SKIP: IPv6 loopback not reachable in this environment"
 fi
 
+echo "== [php-caddy] PHP application logs reach the container log stream =="
+# Core logging contract: PHP's error_log()/worker errors land in `docker logs`
+# (the Coolify log stream), not only inside the container. FPM's error sink
+# follows PINNER_FPM_ERROR_LOG: docker-entrypoint.sh chowns /proc/1/fd/2 and
+# exports /proc/self/fd/2 on success (streamed), otherwise FPM falls back to
+# the log file — in which case (and only then) this check would fail.
+marker="PINNER_PHP_LOG_VT_$(date +%s)"
+echo "<?php error_log('$marker'); echo '$marker';" \
+    | docker exec -i "$container" sh -c \
+        'cat > /var/www/html/pinner-log-verify.php && chown www-data:www-data /var/www/html/pinner-log-verify.php'
+code="$(docker exec "$container" curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080/pinner-log-verify.php")"
+[ "$code" = "200" ] || die "PHP log probe request expected 200, got $code"
+i=0
+until docker logs "$container" 2>&1 | grep -q "$marker"; do
+    i=$((i + 1))
+    [ "$i" -lt 20 ] || { docker logs "$container" 2>&1 | tail -30; die "PHP error_log() marker never reached the container log stream"; }
+    sleep 0.5
+done
+pass "PHP error_log() output appears in the container log stream (marker '$marker')"
+docker exec "$container" rm -f /var/www/html/pinner-log-verify.php
+
 want="$(app_uid_of "$container")"
 assert_pid1_nonroot "$container" "$want"
 assert_nonroot "$container" "$want"
