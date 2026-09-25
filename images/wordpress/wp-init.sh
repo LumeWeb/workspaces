@@ -271,10 +271,27 @@ converge_admin_password() {
 }
 
 # Converge the platform-managed Cast plugin to active on every boot (after the
-# site is installed and WP-CLI can talk to the DB). This performs the REAL
-# activation transition (CastActivator: schema install, rewrite flush) whenever
-# the plugin was never activated; the baked-in cast-guard MU plugin then keeps
-# it active read-side forever, so this is convergence, not enforcement.
+# site is installed and WP-CLI can talk to the DB), performing the REAL
+# activation transition (CastActivator: schema install, cast_version,
+# rewrite flush) EVERY boot — not only when the option lacks cast.
+#
+# Why the WP_INSTALLING dance instead of `wp plugin activate cast`: the
+# baked-in cast-guard MU plugin re-adds cast on every READ of the
+# active_plugins option, so WP-CLI's is_plugin_active() pre-check always
+# reports "already active" and the CLI (and core's activate_plugin() itself,
+# which skips its activation block on the same filtered read) would never run
+# CastActivator — exactly the regression where the plugin is "active" while
+# wp_cast_export_items was never created. Under WP_INSTALLING the guard's
+# force-on filters stand down (see cast-guard.php), letting core's
+# deactivate_plugins()/activate_plugin() see and drive the true option.
+#
+# deactivate_plugins() is silent ($silent=true): it only rewrites the option
+# and fires no hooks; CastDeactivator is a documented no-op anyway. Running
+# the full cycle every boot is safe and self-healing: CastActivator is
+# idempotent (dbDelta no-ops on an unchanged schema; update_option of the
+# version), so a DB whose tables were lost or an activation that once failed
+# is repaired on the next boot. Failure is non-fatal: the MU guard keeps Cast
+# active read-side and a WARN is left for the next boot to retry.
 activate_cast() {
     if ! run_wp core is-installed >/dev/null 2>&1; then
         return 0
@@ -283,8 +300,24 @@ activate_cast() {
         echo "WARN: cast plugin files are missing from the plugins volume; cannot activate." >&2
         return 0
     fi
-    if ! run_wp plugin activate cast >/dev/null 2>&1; then
-        echo "WARN: could not activate the cast plugin (it stays guarded by the MU layer)." >&2
+    # The password-free eval: no secrets on argv; WP_INSTALLING scopes the
+    # guard exemption to this process only (web/cron requests are unaffected).
+    if ! run_wp eval '
+        if ( ! function_exists( "activate_plugin" ) ) {
+            require_once ABSPATH . "wp-admin/includes/plugin.php";
+        }
+        if ( ! defined( "WP_INSTALLING" ) ) {
+            define( "WP_INSTALLING", true );
+        }
+        $cast_main = "cast/cast.php";
+        deactivate_plugins( $cast_main, true );
+        $result = activate_plugin( $cast_main );
+        if ( is_wp_error( $result ) ) {
+            echo "cast activation failed: " . $result->get_error_message() . "\n";
+            exit( 1 );
+        }
+    ' >/dev/null; then
+        echo "WARN: could not run the real cast activation transition (it stays guarded by the MU layer)." >&2
     fi
 }
 
