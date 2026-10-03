@@ -138,6 +138,226 @@ done
 [ "$ran" = "1" ] || die "scheduled due cron event never ran (worker is not ticking the scheduler)"
 pass "cron worker ran a scheduled due-now event via WP-CLI"
 
+echo "== [verify] supervised worker drives due Action Scheduler actions on the cron cadence =="
+# The worker must run due Action Scheduler actions on its own WP_CRON_INTERVAL
+# (5s here) cadence, NOT wait for Action Scheduler's own 1-minute WP-Cron queue
+# event. Push that event 90s into the future so the legacy WP-Cron path CANNOT
+# be what runs the action: anything executing it within the 40s deadline below
+# proves the worker drives the Action Scheduler queue directly. (The baked
+# WP-CLI has no `cron event reschedule`, so use WP's own cron API via `wp eval`,
+# matching the args Action Scheduler registered the event with.) The push-out
+# confirms its result inside one process and retries: a concurrent worker tick
+# re-writing the cron option (lost update) could otherwise restore the old
+# entry between an unschedule and a schedule.
+delta="$(wp eval '
+    $target = time() + 90;
+    $t = false;
+    for ( $i = 0; $i < 5; $i++ ) {
+        $old = wp_next_scheduled( "action_scheduler_run_queue", array( "WP Cron" ) );
+        if ( $old ) { wp_unschedule_event( $old, "action_scheduler_run_queue", array( "WP Cron" ) ); }
+        wp_schedule_event( $target, "every_minute", "action_scheduler_run_queue", array( "WP Cron" ) );
+        $t = wp_next_scheduled( "action_scheduler_run_queue", array( "WP Cron" ) );
+        if ( $t === $target ) { break; }
+    }
+    echo (int) ( $t - time() );
+' --allow-root)"
+[ "$delta" -ge 60 ] || die "could not push the AS WP-Cron queue event out (next run in ${delta}s)"
+# A temporary mu-plugin observes the test hook (mu-plugins are ephemeral and
+# loaded on every request; the file is removed at the end of the check).
+# The same mu-plugin captures the context argument the worker passes to
+# action_scheduler_run_queue: that second argument is Action Scheduler's
+# execution context / log label, and the worker must use the canonical 'WP
+# Cron' context (the label AS's own WP-Cron queue runner uses) so log entries
+# and batch semantics match the built-in runner.
+docker exec "$(wp_container)" sh -c 'cat > /var/www/html/wp-content/mu-plugins/pinner-verify-as.php <<EOF
+<?php
+add_action( "pinner_verify_as_cron", function () {
+    update_option( "pinner_verify_as_ran", time() );
+} );
+add_action( "action_scheduler_run_queue", function ( \$context = "" ) {
+    update_option( "pinner_verify_as_context", (string) \$context );
+} );
+EOF'
+wp eval 'ActionScheduler::factory()->async( "pinner_verify_as_cron" );' --allow-root
+ran=0
+i=0
+while [ "$i" -lt 8 ]; do
+    if [ -n "$(wp option get pinner_verify_as_ran --allow-root 2>/dev/null)" ]; then
+        ran=1
+        break
+    fi
+    sleep 5
+    i=$((i + 1))
+done
+docker exec "$(wp_container)" sh -c 'rm -f /var/www/html/wp-content/mu-plugins/pinner-verify-as.php'
+[ "$ran" = "1" ] || die "due Action Scheduler action never ran within 40s while the AS WP-Cron queue event was pushed 90s out (worker is not driving the AS queue on its WP_CRON_INTERVAL cadence)"
+# The worker's queue run must carry the canonical 'WP Cron' context (the hook
+# payload captured above); a custom label would make AS log entries disagree
+# with its built-in WP-Cron runner.
+ctx="$(wp option get pinner_verify_as_context --allow-root 2>/dev/null || true)"
+[ "$ctx" = "WP Cron" ] \
+    || die "worker fired action_scheduler_run_queue with context '$ctx', expected the canonical 'WP Cron' context"
+pass "worker fired action_scheduler_run_queue with the canonical 'WP Cron' context"
+pass "worker ran a due Action Scheduler action within the 5s cron cadence (independent of the 1-minute AS WP-Cron event)"
+
+echo "== [verify] AS queue-run concurrency guard is registered (no overlapping batches) =="
+# This PR drives the AS queue every WP_CRON_INTERVAL on top of AS's own 1-min
+# WP-Cron event and its async-request runner; all three converge on the
+# action_scheduler_run_queue hook. AS 4.x serializes batches by claim count
+# (concurrent_batches=1), which has a start-up TOCTOU window, so the image
+# closes it with a GLOBAL lock guard (mu-plugin, loaded by every process). Prove
+# the guard and its lock-duration config are actually REGISTERED in the running
+# site (a mu-plugin that never loads would pass an image-content grep but not
+# this), that the guard runs ahead of the runner, and that the queue-run lock
+# duration is aligned with AS's per-batch time limit (the 30s batch) rather than
+# left at the 60s async-runner default.
+as_guard="$(wp eval '
+    if ( ! class_exists( "ActionScheduler_QueueRunner" ) ) { echo "no-as"; exit; }
+    $lock_filter = has_filter( "action_scheduler_lock_duration" );
+    $guard       = has_action( "action_scheduler_run_queue", "pinner_as_queue_run_guard" );
+    $runner      = has_action( "action_scheduler_run_queue", array( ActionScheduler_QueueRunner::instance(), "run" ) );
+    $lock        = (int) apply_filters( "action_scheduler_lock_duration", 60, "pinner-queue-run" );
+    $batch       = (int) apply_filters( "action_scheduler_queue_runner_time_limit", 30 );
+    printf( "%s|%s|%s|%d|%d\n",
+        $lock_filter ? "filter" : "none",
+        $guard ? "guard" : "none",
+        $runner ? "runner" : "none",
+        $lock,
+        $batch );
+' --allow-root)"
+echo "   as_guard=[$as_guard]"
+IFS='|' read -r as_has_lock_filter as_has_guard as_has_runner as_lock_val as_batch_val <<< "$as_guard"
+[ "$as_has_lock_filter" = "filter" ] || die "action_scheduler_lock_duration filter is NOT registered (AS concurrency-guard config missing): [$as_guard]"
+[ "$as_has_guard" = "guard" ] || die "pinner_as_queue_run_guard is NOT registered on action_scheduler_run_queue (AS concurrency guard missing): [$as_guard]"
+[ "$as_has_runner" = "runner" ] || die "AS queue runner is not registered on action_scheduler_run_queue (expected): [$as_guard]"
+[ "$as_lock_val" -ge "$as_batch_val" ] 2>/dev/null || die "AS queue-run lock duration ($as_lock_val) is below the per-batch time limit ($as_batch_val); a slow batch could be overlapped"
+[ "$as_lock_val" -ge 30 ] 2>/dev/null || die "AS queue-run lock duration ($as_lock_val) is below the 30s batch"
+pass "AS concurrency guard registered: lock-duration filter present, queue-run guard ahead of the runner, lock aligned with the ${as_batch_val}s batch"
+
+echo "== [verify] AS queue-run guard: losing run is suppressed per-process, not by callback removal =="
+# Regression guard for a reviewed defect: the old losing branch called
+# remove_action() from INSIDE do_action('action_scheduler_run_queue'), where
+# the runner's callback is already snapshotted into the in-flight hook
+# dispatch — so the removal never prevented the overlapping batch, and the
+# lock was never released. The correction must zero the CURRENT process's
+# allowed concurrent batches through the real
+# 'action_scheduler_queue_runner_concurrent_batches' filter (the runner's
+# has_maximum_concurrent_batches() then bails: claim_count >= 0 is always
+# true), leave the runner callback attached, and never release a lock the
+# losing process did not acquire.
+as_loss="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    ActionScheduler::lock()->set( "pinner-queue-run" ); // we stake the lock first
+    pinner_as_queue_run_guard();                          // this process therefore loses
+    $allowed  = (int) apply_filters( "action_scheduler_queue_runner_concurrent_batches", 1 );
+    $attached = has_action( "action_scheduler_run_queue", array( ActionScheduler_QueueRunner::instance(), "run" ) );
+    $left     = get_option( "action_scheduler_lock_pinner-queue-run" );
+    $held     = ( false !== $left && "" !== $left );
+    printf( "%d|%s|%s\n", $allowed, $attached ? "attached" : "removed", $held ? "held" : "gone" );
+' --allow-root)"
+echo "   as_loss=[$as_loss]"
+IFS='|' read -r as_loss_allowed as_loss_attached as_loss_held <<< "$as_loss"
+[ "$as_loss_allowed" = "0" ] || die "losing process did NOT zero action_scheduler_queue_runner_concurrent_batches (got: ${as_loss_allowed}); an overlapping batch can still run"
+[ "$as_loss_attached" = "attached" ] || die "queue-runner callback was removed (broken remove_action approach); suppression must be the per-process zero-batches filter"
+[ "$as_loss_held" = "held" ] || die "losing process released a lock it did not acquire (lock state: ${as_loss_held})"
+pass "losing run suppressed per-process (concurrent_batches=0), runner callback still attached, foreign lock untouched"
+
+echo "== [verify] AS queue-run guard: owner releases its lock after the run; crash bounded by 30s =="
+# A guarded run in a fresh process must acquire the lock, run the queue, and
+# then delete its precise lock option + object-cache entry in a post-run hook,
+# so the next queue run proceeds immediately instead of waiting out the lock
+# duration. If the process dies mid-run, the un-released lock must still
+# expire via the 30s lock-duration fallback (bounded, not stale-forever).
+as_release="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    do_action( "action_scheduler_run_queue", "WP Cron" ); // guarded run
+    $left = get_option( "action_scheduler_lock_pinner-queue-run" );
+    echo ( false === $left || "" === $left ) ? "released" : "leaked:" . $left;
+' --allow-root)"
+# A concurrent worker tick may have won the lock first; that owner releases
+# it in its own post-run hook within seconds, so allow a short grace period.
+i=0
+while [ "$i" -lt 10 ] && [ "$as_release" != "released" ]; do
+    sleep 2
+    left="$(wp option get action_scheduler_lock_pinner-queue-run --allow-root 2>/dev/null || true)"
+    [ -z "$left" ] && as_release="released"
+    i=$((i + 1))
+done
+[ "$as_release" = "released" ] || die "queue-run lock not released after the guarded run (got: $as_release)"
+pass "lock option deleted by the owner in a post-run hook after the guarded run"
+
+as_crash="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    ActionScheduler::lock()->set( "pinner-queue-run" ); // crash: no post-run release
+    $parts = explode( "|", (string) get_option( "action_scheduler_lock_pinner-queue-run" ) );
+    echo (int) ( end( $parts ) - time() );
+' --allow-root)"
+[ "$as_crash" -ge 28 ] 2>/dev/null && [ "$as_crash" -le 31 ] 2>/dev/null \
+    || die "un-released (crashed) queue-run lock is not bounded by the 30s duration fallback (expires in ${as_crash}s)"
+pass "crash backstop: an un-released lock expires via the 30s duration fallback (expires in ${as_crash}s)"
+
+echo "== [verify] AS queue-run guard: post-run release is compare-and-delete (stale owner keeps the newer lock) =="
+# A post-run release must delete ONLY the exact lock value THIS process staked.
+# If our lock expired (crashed/slow run) and a second owner replaced it, our
+# late release callback must leave the newer owner's lock — and its
+# object-cache entries — in place. Simulated: this process acquires the lock
+# through the real guard (owner A), the lock is aged past its 30s expiry, a
+# second owner (B) replaces it, then A's post-run release hook fires.
+# Retried while a concurrent worker tick wins the lock first (then this
+# process is the losing side, not A, and the attempt is inconclusive).
+as_cas=""
+i=0
+while [ -z "$as_cas" ] && [ "$i" -lt 4 ]; do
+    as_cas="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    global $wpdb;
+    $key = "action_scheduler_lock_pinner-queue-run";
+    // Read the lock row straight from the DB: the WP option caches
+    // (per-option and bulk alloptions) go stale next to direct SQL writes
+    // by AS, so cache-based reads would make this check inconclusive.
+    $dbv = function () use ( $wpdb, $key ) {
+        $v = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s", $key ) );
+        return false === $v ? "NONE" : (string) $v;
+    };
+    delete_option( $key );
+    wp_cache_delete( $key, "action_scheduler_locks" );
+    pinner_as_queue_run_guard(); // owner A acquires (installs its release hook)
+    if ( ! has_action( "action_scheduler_after_process_queue", "pinner_as_queue_release_lock" ) ) {
+        echo "retry"; // a concurrent worker won the lock; this attempt is not owner A
+        exit;
+    }
+    $a = $dbv();
+    $exp = end( explode( "|", (string) $a ) );
+    wp_cache_delete( $key, "action_scheduler_locks" ); // drop the AS object-cache copy of the live value
+    update_option( $key, (int) $exp - 60 );            // age the lock past its 30s expiry
+    sleep( 1 );                                        // ensure B stakes a distinct value
+    if ( ! ActionScheduler::lock()->set( "pinner-queue-run" ) ) {
+        echo "retry"; // a concurrent owner won; this attempt is inconclusive
+        exit;
+    }
+    $b = $dbv(); // the newer owners exact lock value
+    do_action( "action_scheduler_after_process_queue" ); // A finally finishes
+    $left  = $dbv();
+    $cache = wp_cache_get( $key, "action_scheduler_locks" );
+    printf(
+        "%s|%s|%s\n",
+        md5( $b ), // fingerprint only: the raw value contains a pipe
+        $left === $b ? "db:kept" : "db:lost",
+        ( false !== $cache && (string) $cache === (string) $b ) ? "cache:kept" : "cache:lost"
+    );
+' --allow-root)"
+    [ "$as_cas" = "retry" ] && as_cas=""
+    i=$((i + 1))
+done
+echo "   as_cas=[$as_cas]"
+IFS='|' read -r as_cas_b as_cas_db as_cas_cache <<< "$as_cas"
+[ "$as_cas_db" = "db:kept" ] || die "stale owner's post-run release deleted the NEWER owner's lock (db: ${as_cas_db}, newer value: ${as_cas_b})"
+[ "$as_cas_cache" = "cache:kept" ] || die "stale owner's post-run release invalidated the NEWER owner's lock cache entry (cache: ${as_cas_cache})"
+pass "post-run release is compare-and-delete: a stale owner leaves the newer owner's lock + cache intact"
+
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
 # mount root, see prepare_uploads). WordPress 7.x does create the current
