@@ -72,8 +72,9 @@ Runs as root (via the base `PINNER_INIT` hook) before privileges are dropped:
    mounted volumes (copy-based, never symlinks), so the default theme, bundled
    plugins, and the platform-managed **cast** plugin appear on a brand-new
    shadowing volume.
-4. **Copy `mu-plugins`** (the Cast guard) into the ephemeral `wp-content` on
-   every boot — it is platform-owned code like core, not persistent content.
+4. **Copy `mu-plugins`** (the Cast guard + the Action Scheduler queue-run
+   guard) into the ephemeral `wp-content` on every boot — they are
+   platform-owned code like core, not persistent content.
 5. **Leave `uploads` unseeded** (user media only).
 6. **Generate `wp-config.php`** with WP-CLI `wp config create` as `www-data`
    (mode **0600**, owner-only read; DB password + proxy/URL extra PHP travel on
@@ -139,6 +140,40 @@ With web cron disabled, the scheduler is driven by a third supervised child
   worker cannot take an otherwise-healthy container down.
 - Being a supervised child, an actual worker death fails the container
   (orchestrator restarts it), and `TERM`/`INT`/`QUIT` shut it down gracefully.
+
+### Action Scheduler queue concurrency guard (`mu-plugins/as-queue-guard.php`)
+
+The worker also fires Action Scheduler's own `action_scheduler_run_queue` hook
+on every tick, so due AS actions run on `WP_CRON_INTERVAL` instead of waiting
+for AS's 1-minute WP-Cron queue event. That means `ActionScheduler_QueueRunner::run()`
+is now invoked from **three** sources that all converge on the same hook: the
+supervised worker (every 30s), AS's own WP-Cron event (every 60s), and AS's
+async-request runner (on admin requests). All three load mu-plugins.
+
+AS 4.x (the version Cast vendors) already serializes batches by **claim count**:
+`has_maximum_concurrent_batches()` blocks a new batch while one holds a claim
+(`action_scheduler_queue_runner_concurrent_batches`, default **1**). That guard
+has a start-up TOCTOU window, though — two runs that both start before *either*
+drives its claim both proceed, staking two overlapping claims. Driving the queue
+twice as often (worker + native event firing together every 60s) widens that
+window, so a slow, non-idempotent batch could be re-entered.
+
+The image closes the window with a **global** lock guard (a mu-plugin, so it
+covers the worker *and* the native WP-Cron event *and* the async runner — a
+per-invocation `add_filter` in the worker's `wp eval` would only cover that one
+process). On every `action_scheduler_run_queue` it runs **before** the AS runner
+(priority 5 vs 10): it takes a compare-and-swap lock via
+`ActionScheduler::lock()`; if a concurrent run already holds it, it removes the
+runner's handler for that process so this run is a no-op instead of an
+overlapping batch. The lock's duration is aligned to AS's own per-batch time
+limit (`action_scheduler_queue_runner_time_limit`, 30s) so a normal batch is
+fully covered; a batch that outlives the lock is backstopped by the claim-count
+guard above.
+
+> Note: the concurrency filter is `action_scheduler_lock_duration` — **not**
+> `action_scheduler_lock_timeout`, which does not exist in AS 4.2. That lock
+> only gates the async *dispatch* throttle; the queue run itself is serialized
+> by the claim count plus this guard lock.
 
 ### Automatic bootstrap (`wp core install` + password converge)
 

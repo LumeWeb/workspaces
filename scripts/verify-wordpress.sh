@@ -200,6 +200,40 @@ ctx="$(wp option get pinner_verify_as_context --allow-root 2>/dev/null || true)"
 pass "worker fired action_scheduler_run_queue with the canonical 'WP Cron' context"
 pass "worker ran a due Action Scheduler action within the 5s cron cadence (independent of the 1-minute AS WP-Cron event)"
 
+echo "== [verify] AS queue-run concurrency guard is registered (no overlapping batches) =="
+# This PR drives the AS queue every WP_CRON_INTERVAL on top of AS's own 1-min
+# WP-Cron event and its async-request runner; all three converge on the
+# action_scheduler_run_queue hook. AS 4.x serializes batches by claim count
+# (concurrent_batches=1), which has a start-up TOCTOU window, so the image
+# closes it with a GLOBAL lock guard (mu-plugin, loaded by every process). Prove
+# the guard and its lock-duration config are actually REGISTERED in the running
+# site (a mu-plugin that never loads would pass an image-content grep but not
+# this), that the guard runs ahead of the runner, and that the queue-run lock
+# duration is aligned with AS's per-batch time limit (the 30s batch) rather than
+# left at the 60s async-runner default.
+as_guard="$(wp eval '
+    if ( ! class_exists( "ActionScheduler_QueueRunner" ) ) { echo "no-as"; exit; }
+    $lock_filter = has_filter( "action_scheduler_lock_duration" );
+    $guard       = has_action( "action_scheduler_run_queue", "pinner_as_queue_run_guard" );
+    $runner      = has_action( "action_scheduler_run_queue", array( ActionScheduler_QueueRunner::instance(), "run" ) );
+    $lock        = (int) apply_filters( "action_scheduler_lock_duration", 60, "pinner-queue-run" );
+    $batch       = (int) apply_filters( "action_scheduler_queue_runner_time_limit", 30 );
+    printf( "%s|%s|%s|%d|%d\n",
+        $lock_filter ? "filter" : "none",
+        $guard ? "guard" : "none",
+        $runner ? "runner" : "none",
+        $lock,
+        $batch );
+' --allow-root)"
+echo "   as_guard=[$as_guard]"
+IFS='|' read -r as_has_lock_filter as_has_guard as_has_runner as_lock_val as_batch_val <<< "$as_guard"
+[ "$as_has_lock_filter" = "filter" ] || die "action_scheduler_lock_duration filter is NOT registered (AS concurrency-guard config missing): [$as_guard]"
+[ "$as_has_guard" = "guard" ] || die "pinner_as_queue_run_guard is NOT registered on action_scheduler_run_queue (AS concurrency guard missing): [$as_guard]"
+[ "$as_has_runner" = "runner" ] || die "AS queue runner is not registered on action_scheduler_run_queue (expected): [$as_guard]"
+[ "$as_lock_val" -ge "$as_batch_val" ] 2>/dev/null || die "AS queue-run lock duration ($as_lock_val) is below the per-batch time limit ($as_batch_val); a slow batch could be overlapped"
+[ "$as_lock_val" -ge 30 ] 2>/dev/null || die "AS queue-run lock duration ($as_lock_val) is below the 30s batch"
+pass "AS concurrency guard registered: lock-duration filter present, queue-run guard ahead of the runner, lock aligned with the ${as_batch_val}s batch"
+
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
 # mount root, see prepare_uploads). WordPress 7.x does create the current

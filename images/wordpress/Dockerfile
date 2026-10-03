@@ -136,6 +136,13 @@ COPY --from=cast-builder /out/cast /usr/src/wordpress/wp-content/plugins/cast
 # stays active regardless of what wp-admin does with active_plugins.
 COPY mu-plugins/cast-guard.php /usr/src/wordpress/wp-content/mu-plugins/cast-guard.php
 
+# -- Action Scheduler queue-run guard MU plugin (concurrency) -----------------
+# Also ephemeral and copied into wp-content/mu-plugins every boot by
+# wp-init.sh's seed_mu_plugins(). Serializes Action Scheduler queue runs across
+# the supervised worker, AS's own WP-Cron event, and the async-request runner
+# so the faster worker cadence cannot overlap a batch (see the file header).
+COPY mu-plugins/as-queue-guard.php /usr/src/wordpress/wp-content/mu-plugins/as-queue-guard.php
+
 # -- startup init hook --------------------------------------------------------
 # Runs as root before the base drops privileges: copies core into the ephemeral
 # docroot, seeds persistent themes/plugins onto (possibly root-owned) volumes,
