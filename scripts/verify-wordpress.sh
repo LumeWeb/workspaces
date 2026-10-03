@@ -138,6 +138,53 @@ done
 [ "$ran" = "1" ] || die "scheduled due cron event never ran (worker is not ticking the scheduler)"
 pass "cron worker ran a scheduled due-now event via WP-CLI"
 
+echo "== [verify] supervised worker drives due Action Scheduler actions on the cron cadence =="
+# The worker must run due Action Scheduler actions on its own WP_CRON_INTERVAL
+# (5s here) cadence, NOT wait for Action Scheduler's own 1-minute WP-Cron queue
+# event. Push that event 90s into the future so the legacy WP-Cron path CANNOT
+# be what runs the action: anything executing it within the 40s deadline below
+# proves the worker drives the Action Scheduler queue directly. (The baked
+# WP-CLI has no `cron event reschedule`, so use WP's own cron API via `wp eval`,
+# matching the args Action Scheduler registered the event with.) The push-out
+# confirms its result inside one process and retries: a concurrent worker tick
+# re-writing the cron option (lost update) could otherwise restore the old
+# entry between an unschedule and a schedule.
+delta="$(wp eval '
+    $target = time() + 90;
+    $t = false;
+    for ( $i = 0; $i < 5; $i++ ) {
+        $old = wp_next_scheduled( "action_scheduler_run_queue", array( "WP Cron" ) );
+        if ( $old ) { wp_unschedule_event( $old, "action_scheduler_run_queue", array( "WP Cron" ) ); }
+        wp_schedule_event( $target, "every_minute", "action_scheduler_run_queue", array( "WP Cron" ) );
+        $t = wp_next_scheduled( "action_scheduler_run_queue", array( "WP Cron" ) );
+        if ( $t === $target ) { break; }
+    }
+    echo (int) ( $t - time() );
+' --allow-root)"
+[ "$delta" -ge 60 ] || die "could not push the AS WP-Cron queue event out (next run in ${delta}s)"
+# A temporary mu-plugin observes the test hook (mu-plugins are ephemeral and
+# loaded on every request; the file is removed at the end of the check).
+docker exec "$(wp_container)" sh -c 'cat > /var/www/html/wp-content/mu-plugins/pinner-verify-as.php <<EOF
+<?php
+add_action( "pinner_verify_as_cron", function () {
+    update_option( "pinner_verify_as_ran", time() );
+} );
+EOF'
+wp eval 'ActionScheduler::factory()->async( "pinner_verify_as_cron" );' --allow-root
+ran=0
+i=0
+while [ "$i" -lt 8 ]; do
+    if [ -n "$(wp option get pinner_verify_as_ran --allow-root 2>/dev/null)" ]; then
+        ran=1
+        break
+    fi
+    sleep 5
+    i=$((i + 1))
+done
+docker exec "$(wp_container)" sh -c 'rm -f /var/www/html/wp-content/mu-plugins/pinner-verify-as.php'
+[ "$ran" = "1" ] || die "due Action Scheduler action never ran within 40s while the AS WP-Cron queue event was pushed 90s out (worker is not driving the AS queue on its WP_CRON_INTERVAL cadence)"
+pass "worker ran a due Action Scheduler action within the 5s cron cadence (independent of the 1-minute AS WP-Cron event)"
+
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
 # mount root, see prepare_uploads). WordPress 7.x does create the current

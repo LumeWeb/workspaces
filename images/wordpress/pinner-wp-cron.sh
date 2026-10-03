@@ -7,7 +7,11 @@
 # pinner-supervise.sh after the base entrypoint's privilege drop) and drives
 # WP's OWN scheduler: every tick WP-CLI runs only the events WP considers due,
 # so cron semantics stay WordPress-native — there is no DIY cron daemon, no
-# crontab, and no schedule duplicated outside WP.
+# crontab, and no schedule duplicated outside WP. It ALSO fires Action
+# Scheduler's own queue hook on every tick, so due Action Scheduler actions
+# run on this same short cadence instead of waiting for Action Scheduler's
+# 1-minute WP-Cron queue event. Neither is a DIY scheduler: both are the
+# site's own queue, driven directly.
 #
 # Lifecycle: this is a supervised child, so a crash takes the container down
 # with it (fail-fast, like PHP-FPM/Caddy). Transient WP failures (DB coming up,
@@ -43,6 +47,21 @@ while :; do
     # warned on stderr and retried next tick.
     if ! "$WP" --path="$DOCROOT" cron event run --due-now >/dev/null 2>&1; then
         echo "WARN: [wp-cron] 'wp cron event run --due-now' failed; will retry next tick" >&2
+    fi
+    # Action Scheduler's own queue event only fires on a 1-minute WP-Cron
+    # schedule, so due actions would otherwise wait up to a minute. Fire the
+    # same 'action_scheduler_run_queue' hook that event triggers — the same
+    # way Action Scheduler's own async runner does it, with an explicit
+    # context — so due actions run on THIS worker's cadence. The
+    # class_exists guard makes this a no-op on sites without Action Scheduler
+    # (Cast vendors it); a failing run is warned on stderr and retried next
+    # tick, never fatal to supervision.
+    if ! "$WP" --path="$DOCROOT" eval '
+        if ( class_exists( "ActionScheduler_QueueRunner" ) ) {
+            do_action( "action_scheduler_run_queue", "Pinner WP Cron" );
+        }
+    ' >/dev/null 2>&1; then
+        echo "WARN: [wp-cron] Action Scheduler queue run failed; will retry next tick" >&2
     fi
     sleep "$INTERVAL"
 done
