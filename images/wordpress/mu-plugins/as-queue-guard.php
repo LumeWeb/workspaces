@@ -9,8 +9,10 @@
  *              A run that cannot acquire the queue lock zeroes ITS OWN
  *              process's allowed concurrent batches (the runner then stakes
  *              no claim at all), and the lock owner deletes the lock in a
- *              post-run hook; a crash mid-run is backstopped by the lock's
- *              30s duration.
+ *              post-run hook ONLY IF the option still carries the exact
+ *              value this process staked (compare-and-delete: an expired
+ *              owner must never delete a newer owner's lock). A crash
+ *              mid-run is backstopped by the lock's 30s duration.
  * Version:     0.1.0
  * Author:      LumeWeb
  * License:     GPL-3.0-or-later
@@ -77,7 +79,8 @@ add_filter(
  *
  * Acquire the compare-and-swap lock. On success the runner proceeds and this
  * process installs a post-run hook that deletes the lock once the run has
- * finished (only the acquirer ever releases it). If a concurrent run already
+ * finished (only the acquirer ever releases it, and only the exact value it
+ * staked — see pinner_as_queue_release_lock). If a concurrent run already
  * holds the lock, zero THIS process's allowed concurrent batches through the
  * real 'action_scheduler_queue_runner_concurrent_batches' filter so the
  * runner's has_maximum_concurrent_batches() bails before staking any claim.
@@ -95,11 +98,25 @@ add_filter(
  */
 function pinner_as_queue_run_guard(): void
 {
+    global $wpdb;
+
     if (!class_exists('ActionScheduler_QueueRunner') || !class_exists('ActionScheduler')) {
         return;
     }
 
+    // AS 4.2's OptionLock::set() returns only a bool; the exact value it
+    // staked (a unique "id|expiry" string) lives in the options row. Capture
+    // it straight from the DB — the WP option caches (per-option and the bulk
+    // 'alloptions' entry) can be stale in this process right after AS's
+    // direct SQL insert — so the post-run release can compare-and-delete it.
     if (ActionScheduler::lock()->set(PINNER_AS_QUEUE_LOCK)) {
+        $GLOBALS['pinner_as_queue_lock_value'] = $wpdb->get_var(
+            $wpdb->prepare(
+                'SELECT option_value FROM ' . $wpdb->options . ' WHERE option_name = %s',
+                'action_scheduler_lock_' . PINNER_AS_QUEUE_LOCK
+            )
+        );
+
         // We own the lock: the runner proceeds below, and once the queue run
         // has finished we delete the lock in a post-run hook so the next run
         // does not wait out the lock duration. If this process dies mid-run,
@@ -128,19 +145,48 @@ function pinner_as_queue_run_guard(): void
  *
  * Only the process that ACQUIRED the lock installs this callback (in
  * pinner_as_queue_run_guard), so a losing process can never delete a lock a
- * concurrent run still relies on. Deletes exactly the lock option and its
- * object-cache entry — the 'action_scheduler_locks' group that Action
+ * concurrent run still relies on. Even the acquirer only deletes the lock
+ * when the option still carries the EXACT value this process staked
+ * (compare-and-delete): if our lock expired mid-run and a newer owner
+ * replaced it, the conditional delete matches no row and the newer owner's
+ * lock — and its cache entries — are left alone.
+ *
+ * Cache entries are invalidated only when the conditional delete actually
+ * removed our row: the 'action_scheduler_locks' group that Action
  * Scheduler's OptionLock (AS 4.2) caches the
- * 'action_scheduler_lock_pinner-queue-run' option under — nothing else.
+ * 'action_scheduler_lock_pinner-queue-run' option under, plus the WordPress
+ * option caches (the per-option entry and the bulk 'alloptions' entry this
+ * WordPress version keeps in the 'options' group) — nothing else.
  */
 function pinner_as_queue_release_lock(): void
 {
     global $wpdb;
 
+    $lock_value = $GLOBALS['pinner_as_queue_lock_value'] ?? null;
+    if (null === $lock_value) {
+        // Defensive: this callback is only ever installed by the acquirer,
+        // which always captures its value. Nothing to release.
+        return;
+    }
+
     $lock_key = 'action_scheduler_lock_' . PINNER_AS_QUEUE_LOCK;
-    $wpdb->delete($wpdb->options, array('option_name' => $lock_key));
-    wp_cache_delete($lock_key, 'action_scheduler_locks');
-    wp_cache_delete($lock_key, 'options');
+
+    // Compare-and-delete: remove the row only if it still holds the exact
+    // value we staked. $wpdb->query() returns the affected-row count (0 when
+    // a newer owner's value no longer matches) or null on failure.
+    $deleted = $wpdb->query(
+        $wpdb->prepare(
+            'DELETE FROM ' . $wpdb->options . ' WHERE option_name = %s AND option_value = %s',
+            $lock_key,
+            (string) $lock_value
+        )
+    );
+
+    if ($deleted) {
+        wp_cache_delete($lock_key, 'action_scheduler_locks');
+        wp_cache_delete($lock_key, 'options');
+        wp_cache_delete('alloptions', 'options');
+    }
 }
 
 add_action('action_scheduler_run_queue', 'pinner_as_queue_run_guard', 5);

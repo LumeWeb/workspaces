@@ -299,6 +299,65 @@ as_crash="$(wp eval '
     || die "un-released (crashed) queue-run lock is not bounded by the 30s duration fallback (expires in ${as_crash}s)"
 pass "crash backstop: an un-released lock expires via the 30s duration fallback (expires in ${as_crash}s)"
 
+echo "== [verify] AS queue-run guard: post-run release is compare-and-delete (stale owner keeps the newer lock) =="
+# A post-run release must delete ONLY the exact lock value THIS process staked.
+# If our lock expired (crashed/slow run) and a second owner replaced it, our
+# late release callback must leave the newer owner's lock — and its
+# object-cache entries — in place. Simulated: this process acquires the lock
+# through the real guard (owner A), the lock is aged past its 30s expiry, a
+# second owner (B) replaces it, then A's post-run release hook fires.
+# Retried while a concurrent worker tick wins the lock first (then this
+# process is the losing side, not A, and the attempt is inconclusive).
+as_cas=""
+i=0
+while [ -z "$as_cas" ] && [ "$i" -lt 4 ]; do
+    as_cas="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    global $wpdb;
+    $key = "action_scheduler_lock_pinner-queue-run";
+    // Read the lock row straight from the DB: the WP option caches
+    // (per-option and bulk alloptions) go stale next to direct SQL writes
+    // by AS, so cache-based reads would make this check inconclusive.
+    $dbv = function () use ( $wpdb, $key ) {
+        $v = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s", $key ) );
+        return false === $v ? "NONE" : (string) $v;
+    };
+    delete_option( $key );
+    wp_cache_delete( $key, "action_scheduler_locks" );
+    pinner_as_queue_run_guard(); // owner A acquires (installs its release hook)
+    if ( ! has_action( "action_scheduler_after_process_queue", "pinner_as_queue_release_lock" ) ) {
+        echo "retry"; // a concurrent worker won the lock; this attempt is not owner A
+        exit;
+    }
+    $a = $dbv();
+    $exp = end( explode( "|", (string) $a ) );
+    wp_cache_delete( $key, "action_scheduler_locks" ); // drop the AS object-cache copy of the live value
+    update_option( $key, (int) $exp - 60 );            // age the lock past its 30s expiry
+    sleep( 1 );                                        // ensure B stakes a distinct value
+    if ( ! ActionScheduler::lock()->set( "pinner-queue-run" ) ) {
+        echo "retry"; // a concurrent owner won; this attempt is inconclusive
+        exit;
+    }
+    $b = $dbv(); // the newer owners exact lock value
+    do_action( "action_scheduler_after_process_queue" ); // A finally finishes
+    $left  = $dbv();
+    $cache = wp_cache_get( $key, "action_scheduler_locks" );
+    printf(
+        "%s|%s|%s\n",
+        md5( $b ), // fingerprint only: the raw value contains a pipe
+        $left === $b ? "db:kept" : "db:lost",
+        ( false !== $cache && (string) $cache === (string) $b ) ? "cache:kept" : "cache:lost"
+    );
+' --allow-root)"
+    [ "$as_cas" = "retry" ] && as_cas=""
+    i=$((i + 1))
+done
+echo "   as_cas=[$as_cas]"
+IFS='|' read -r as_cas_b as_cas_db as_cas_cache <<< "$as_cas"
+[ "$as_cas_db" = "db:kept" ] || die "stale owner's post-run release deleted the NEWER owner's lock (db: ${as_cas_db}, newer value: ${as_cas_b})"
+[ "$as_cas_cache" = "cache:kept" ] || die "stale owner's post-run release invalidated the NEWER owner's lock cache entry (cache: ${as_cas_cache})"
+pass "post-run release is compare-and-delete: a stale owner leaves the newer owner's lock + cache intact"
+
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
 # mount root, see prepare_uploads). WordPress 7.x does create the current
