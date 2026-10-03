@@ -164,10 +164,18 @@ delta="$(wp eval '
 [ "$delta" -ge 60 ] || die "could not push the AS WP-Cron queue event out (next run in ${delta}s)"
 # A temporary mu-plugin observes the test hook (mu-plugins are ephemeral and
 # loaded on every request; the file is removed at the end of the check).
+# The same mu-plugin captures the context argument the worker passes to
+# action_scheduler_run_queue: that second argument is Action Scheduler's
+# execution context / log label, and the worker must use the canonical 'WP
+# Cron' context (the label AS's own WP-Cron queue runner uses) so log entries
+# and batch semantics match the built-in runner.
 docker exec "$(wp_container)" sh -c 'cat > /var/www/html/wp-content/mu-plugins/pinner-verify-as.php <<EOF
 <?php
 add_action( "pinner_verify_as_cron", function () {
     update_option( "pinner_verify_as_ran", time() );
+} );
+add_action( "action_scheduler_run_queue", function ( \$context = "" ) {
+    update_option( "pinner_verify_as_context", (string) \$context );
 } );
 EOF'
 wp eval 'ActionScheduler::factory()->async( "pinner_verify_as_cron" );' --allow-root
@@ -183,6 +191,13 @@ while [ "$i" -lt 8 ]; do
 done
 docker exec "$(wp_container)" sh -c 'rm -f /var/www/html/wp-content/mu-plugins/pinner-verify-as.php'
 [ "$ran" = "1" ] || die "due Action Scheduler action never ran within 40s while the AS WP-Cron queue event was pushed 90s out (worker is not driving the AS queue on its WP_CRON_INTERVAL cadence)"
+# The worker's queue run must carry the canonical 'WP Cron' context (the hook
+# payload captured above); a custom label would make AS log entries disagree
+# with its built-in WP-Cron runner.
+ctx="$(wp option get pinner_verify_as_context --allow-root 2>/dev/null || true)"
+[ "$ctx" = "WP Cron" ] \
+    || die "worker fired action_scheduler_run_queue with context '$ctx', expected the canonical 'WP Cron' context"
+pass "worker fired action_scheduler_run_queue with the canonical 'WP Cron' context"
 pass "worker ran a due Action Scheduler action within the 5s cron cadence (independent of the 1-minute AS WP-Cron event)"
 
 echo "== [verify] fresh shadowing volume: uploads unseeded =="

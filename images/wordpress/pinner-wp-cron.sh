@@ -50,15 +50,16 @@ while :; do
     fi
     # Action Scheduler's own queue event only fires on a 1-minute WP-Cron
     # schedule, so due actions would otherwise wait up to a minute. Fire the
-    # same 'action_scheduler_run_queue' hook that event triggers — the same
-    # way Action Scheduler's own async runner does it, with an explicit
-    # context — so due actions run on THIS worker's cadence. The
-    # class_exists guard makes this a no-op on sites without Action Scheduler
-    # (Cast vendors it); a failing run is warned on stderr and retried next
-    # tick, never fatal to supervision.
+    # same 'action_scheduler_run_queue' hook that event triggers, with the
+    # same canonical 'WP Cron' execution context the event passes (the second
+    # argument is Action Scheduler's log/context label, not an identifier),
+    # so due actions run on THIS worker's cadence and AS log entries match
+    # its built-in WP-Cron runner. The class_exists guard makes this a no-op
+    # on sites without Action Scheduler (Cast vendors it); a failing run is
+    # warned on stderr and retried next tick, never fatal to supervision.
     if ! "$WP" --path="$DOCROOT" eval '
         if ( class_exists( "ActionScheduler_QueueRunner" ) ) {
-            do_action( "action_scheduler_run_queue", "Pinner WP Cron" );
+            do_action( "action_scheduler_run_queue", "WP Cron" );
         }
     ' >/dev/null 2>&1; then
         echo "WARN: [wp-cron] Action Scheduler queue run failed; will retry next tick" >&2
