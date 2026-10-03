@@ -234,6 +234,71 @@ IFS='|' read -r as_has_lock_filter as_has_guard as_has_runner as_lock_val as_bat
 [ "$as_lock_val" -ge 30 ] 2>/dev/null || die "AS queue-run lock duration ($as_lock_val) is below the 30s batch"
 pass "AS concurrency guard registered: lock-duration filter present, queue-run guard ahead of the runner, lock aligned with the ${as_batch_val}s batch"
 
+echo "== [verify] AS queue-run guard: losing run is suppressed per-process, not by callback removal =="
+# Regression guard for a reviewed defect: the old losing branch called
+# remove_action() from INSIDE do_action('action_scheduler_run_queue'), where
+# the runner's callback is already snapshotted into the in-flight hook
+# dispatch — so the removal never prevented the overlapping batch, and the
+# lock was never released. The correction must zero the CURRENT process's
+# allowed concurrent batches through the real
+# 'action_scheduler_queue_runner_concurrent_batches' filter (the runner's
+# has_maximum_concurrent_batches() then bails: claim_count >= 0 is always
+# true), leave the runner callback attached, and never release a lock the
+# losing process did not acquire.
+as_loss="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    ActionScheduler::lock()->set( "pinner-queue-run" ); // we stake the lock first
+    pinner_as_queue_run_guard();                          // this process therefore loses
+    $allowed  = (int) apply_filters( "action_scheduler_queue_runner_concurrent_batches", 1 );
+    $attached = has_action( "action_scheduler_run_queue", array( ActionScheduler_QueueRunner::instance(), "run" ) );
+    $left     = get_option( "action_scheduler_lock_pinner-queue-run" );
+    $held     = ( false !== $left && "" !== $left );
+    printf( "%d|%s|%s\n", $allowed, $attached ? "attached" : "removed", $held ? "held" : "gone" );
+' --allow-root)"
+echo "   as_loss=[$as_loss]"
+IFS='|' read -r as_loss_allowed as_loss_attached as_loss_held <<< "$as_loss"
+[ "$as_loss_allowed" = "0" ] || die "losing process did NOT zero action_scheduler_queue_runner_concurrent_batches (got: ${as_loss_allowed}); an overlapping batch can still run"
+[ "$as_loss_attached" = "attached" ] || die "queue-runner callback was removed (broken remove_action approach); suppression must be the per-process zero-batches filter"
+[ "$as_loss_held" = "held" ] || die "losing process released a lock it did not acquire (lock state: ${as_loss_held})"
+pass "losing run suppressed per-process (concurrent_batches=0), runner callback still attached, foreign lock untouched"
+
+echo "== [verify] AS queue-run guard: owner releases its lock after the run; crash bounded by 30s =="
+# A guarded run in a fresh process must acquire the lock, run the queue, and
+# then delete its precise lock option + object-cache entry in a post-run hook,
+# so the next queue run proceeds immediately instead of waiting out the lock
+# duration. If the process dies mid-run, the un-released lock must still
+# expire via the 30s lock-duration fallback (bounded, not stale-forever).
+as_release="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    do_action( "action_scheduler_run_queue", "WP Cron" ); // guarded run
+    $left = get_option( "action_scheduler_lock_pinner-queue-run" );
+    echo ( false === $left || "" === $left ) ? "released" : "leaked:" . $left;
+' --allow-root)"
+# A concurrent worker tick may have won the lock first; that owner releases
+# it in its own post-run hook within seconds, so allow a short grace period.
+i=0
+while [ "$i" -lt 10 ] && [ "$as_release" != "released" ]; do
+    sleep 2
+    left="$(wp option get action_scheduler_lock_pinner-queue-run --allow-root 2>/dev/null || true)"
+    [ -z "$left" ] && as_release="released"
+    i=$((i + 1))
+done
+[ "$as_release" = "released" ] || die "queue-run lock not released after the guarded run (got: $as_release)"
+pass "lock option deleted by the owner in a post-run hook after the guarded run"
+
+as_crash="$(wp eval '
+    if ( ! class_exists( "ActionScheduler" ) ) { echo "no-as"; exit; }
+    delete_option( "action_scheduler_lock_pinner-queue-run" );
+    ActionScheduler::lock()->set( "pinner-queue-run" ); // crash: no post-run release
+    $parts = explode( "|", (string) get_option( "action_scheduler_lock_pinner-queue-run" ) );
+    echo (int) ( end( $parts ) - time() );
+' --allow-root)"
+[ "$as_crash" -ge 28 ] 2>/dev/null && [ "$as_crash" -le 31 ] 2>/dev/null \
+    || die "un-released (crashed) queue-run lock is not bounded by the 30s duration fallback (expires in ${as_crash}s)"
+pass "crash backstop: an un-released lock expires via the 30s duration fallback (expires in ${as_crash}s)"
+
 echo "== [verify] fresh shadowing volume: uploads unseeded =="
 # The image must never seed user media into uploads (wp-init only creates the
 # mount root, see prepare_uploads). WordPress 7.x does create the current

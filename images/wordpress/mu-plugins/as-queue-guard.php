@@ -5,9 +5,12 @@
  * Description: Serializes Action Scheduler queue runs so the supervised WP-cron
  *              worker's every-tick drive cannot overlap a batch with AS's own
  *              1-minute WP-Cron event or its async-request runner. Registered
- *              before the AS queue runner on every action_scheduler_run_queue;
- *              a run that cannot acquire the queue lock is dropped instead of
- *              staking a second, overlapping claim.
+ *              before the AS queue runner on every action_scheduler_run_queue.
+ *              A run that cannot acquire the queue lock zeroes ITS OWN
+ *              process's allowed concurrent batches (the runner then stakes
+ *              no claim at all), and the lock owner deletes the lock in a
+ *              post-run hook; a crash mid-run is backstopped by the lock's
+ *              30s duration.
  * Version:     0.1.0
  * Author:      LumeWeb
  * License:     GPL-3.0-or-later
@@ -72,10 +75,23 @@ add_filter(
  * worker's `wp eval` would only cover that single process, not the native
  * WP-Cron event or the async request runner.)
  *
- * Acquire the compare-and-swap lock; on success keep the runner attached and
- * let it run. If a concurrent run already holds the lock, remove the runner's
- * handler for THIS process so this run is a no-op instead of an overlapping
- * batch.
+ * Acquire the compare-and-swap lock. On success the runner proceeds and this
+ * process installs a post-run hook that deletes the lock once the run has
+ * finished (only the acquirer ever releases it). If a concurrent run already
+ * holds the lock, zero THIS process's allowed concurrent batches through the
+ * real 'action_scheduler_queue_runner_concurrent_batches' filter so the
+ * runner's has_maximum_concurrent_batches() bails before staking any claim.
+ *
+ * Why NOT remove_action() here (the reviewed defect): this guard executes
+ * INSIDE do_action('action_scheduler_run_queue'), whose callback list was
+ * snapshotted before the guard ran — a remove_action() issued now only
+ * affects FUTURE invocations, so the already-snapshotted runner would still
+ * run an overlapping batch in this very process. Filters, by contrast, are
+ * consulted lazily when the runner's run() calls
+ * apply_filters('action_scheduler_queue_runner_concurrent_batches', 1), so a
+ * per-process zero takes effect for the in-flight run. Filters live in
+ * process memory, so the suppression covers exactly this losing run and
+ * nothing else.
  */
 function pinner_as_queue_run_guard(): void
 {
@@ -84,12 +100,47 @@ function pinner_as_queue_run_guard(): void
     }
 
     if (ActionScheduler::lock()->set(PINNER_AS_QUEUE_LOCK)) {
-        return; // we own the lock; the runner proceeds below
+        // We own the lock: the runner proceeds below, and once the queue run
+        // has finished we delete the lock in a post-run hook so the next run
+        // does not wait out the lock duration. If this process dies mid-run,
+        // the 30s lock duration above bounds how long the stale lock blocks.
+        add_action('action_scheduler_after_process_queue', 'pinner_as_queue_release_lock');
+
+        return;
     }
 
-    // A concurrent queue run holds the lock: drop the runner so THIS run is a
-    // no-op rather than an overlapping batch.
-    remove_action('action_scheduler_run_queue', array(ActionScheduler_QueueRunner::instance(), 'run'));
+    // A concurrent queue run holds the lock: zero THIS process's allowed
+    // concurrent batches. has_maximum_concurrent_batches() then computes
+    // claim_count >= 0, which is always true, so run() skips staking any
+    // batch at all — this run is a no-op rather than an overlapping batch.
+    // Priority 5 so the zero wins over any other (later-priority) consumer.
+    add_filter(
+        'action_scheduler_queue_runner_concurrent_batches',
+        static function () {
+            return 0;
+        },
+        5
+    );
+}
+
+/**
+ * Release the queue-run lock once the queue run has finished.
+ *
+ * Only the process that ACQUIRED the lock installs this callback (in
+ * pinner_as_queue_run_guard), so a losing process can never delete a lock a
+ * concurrent run still relies on. Deletes exactly the lock option and its
+ * object-cache entry — the 'action_scheduler_locks' group that Action
+ * Scheduler's OptionLock (AS 4.2) caches the
+ * 'action_scheduler_lock_pinner-queue-run' option under — nothing else.
+ */
+function pinner_as_queue_release_lock(): void
+{
+    global $wpdb;
+
+    $lock_key = 'action_scheduler_lock_' . PINNER_AS_QUEUE_LOCK;
+    $wpdb->delete($wpdb->options, array('option_name' => $lock_key));
+    wp_cache_delete($lock_key, 'action_scheduler_locks');
+    wp_cache_delete($lock_key, 'options');
 }
 
 add_action('action_scheduler_run_queue', 'pinner_as_queue_run_guard', 5);
